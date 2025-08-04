@@ -25,7 +25,7 @@ def get_sd_model(args):
     model_id = MODEL_IDS[args.version]
     scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
     pipe = StableDiffusionPipeline.from_pretrained(model_id, scheduler=scheduler, torch_dtype=dtype)
-    pipe.enable_xformers_memory_efficient_attention()
+    #pipe.enable_xformers_memory_efficient_attention()
     vae = pipe.vae
     tokenizer = pipe.tokenizer
     text_encoder = pipe.text_encoder
