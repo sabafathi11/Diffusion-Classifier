@@ -212,7 +212,9 @@ class TemplateLearner(nn.Module):
         Encourage diversity among template embeddings
         """
         # Compute pairwise similarities
-        norm_embeddings = F.normalize(template_embeddings, p=2, dim=1)
+        # template_embeddings shape: (num_templates, num_classes, seq_len, embed_dim)
+        flattened = template_embeddings.view(template_embeddings.size(0), -1)  # (num_templates, num_classes * seq_len * embed_dim)
+        norm_embeddings = F.normalize(flattened, p=2, dim=1)
         similarity_matrix = torch.mm(norm_embeddings, norm_embeddings.t())
         
         # We want off-diagonal elements to be small (diverse templates)

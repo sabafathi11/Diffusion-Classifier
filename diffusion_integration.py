@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from collections import defaultdict
 import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
 # Import from diffusion_classifier.py
 from diffusion_classifier import DiffusionEvaluator, create_balanced_subset
@@ -52,6 +53,7 @@ class DiffusionTemplateTrainer:
         # Create save directory
         self.save_dir = osp.join(args.save_dir, f"templates_{args.dataset}")
         os.makedirs(self.save_dir, exist_ok=True)
+        self.scaler = GradScaler()
         
     def _setup_training_data(self):
         """Setup training data indices"""
@@ -116,7 +118,7 @@ class DiffusionTemplateTrainer:
         return torch.stack(batch_losses), torch.tensor(batch_labels, device=self.device)
     
     def train_epoch(self):
-        """Train templates for one epoch"""
+        """Train templates for one epoch with AMP"""
         self.template_learner.train()
         
         # Shuffle training indices
@@ -124,31 +126,32 @@ class DiffusionTemplateTrainer:
         
         total_loss = 0.0
         num_batches = 0
-        
-        # Process in batches
+
         for i in tqdm.trange(0, len(train_indices_shuffled), self.args.batch_size):
             batch_indices = train_indices_shuffled[i:i+self.args.batch_size]
-            
-            # Compute diffusion losses for this batch
+
             diffusion_losses, true_labels = self.compute_diffusion_losses_batch(batch_indices)
-            
-            # Forward pass through template learner
+
             self.optimizer.zero_grad()
-            
-            results = self.template_learner(diffusion_losses, true_labels)
-            loss = results['total_loss']
-            
-            # Backward pass
-            loss.backward()
-            self.optimizer.step()
-            
+
+            # Use AMP autocast for forward pass
+            with autocast(dtype=torch.float16 if self.args.dtype == 'float16' else torch.float32):
+                results = self.template_learner(diffusion_losses, true_labels)
+                loss = results['total_loss']
+
+            # AMP backward + optimizer step
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
             total_loss += loss.item()
             num_batches += 1
-            
+
             if num_batches % 10 == 0:
                 print(f"Batch {num_batches}, Loss: {loss.item():.4f}")
-        
+
         return total_loss / num_batches if num_batches > 0 else 0.0
+
     
     def evaluate_templates(self):
         """Evaluate current templates"""
