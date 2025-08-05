@@ -262,6 +262,7 @@ def main():
     parser.add_argument('--n_workers', type=int, default=1, help='Number of workers to split the dataset across')
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
+    parser.add_argument('--template_path', type=str, default=None, help='Path to trained templates')
     
     # Template learning args
     parser.add_argument('--num_templates', type=int, default=8)

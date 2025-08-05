@@ -12,6 +12,7 @@ from diffusion.utils import LOG_DIR, get_formatstr
 import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 from collections import defaultdict
+from learnable_templates import TemplateLearner, TemplateConfig, TemplateTextEncoder
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -80,6 +81,9 @@ class DiffusionEvaluator:
             self._setup_prompts()
         self._setup_noise()
         self._setup_run_folder()
+        if self.args.template_path is not None:
+            self._setup_learned_templates()
+  
         
     def _setup_models(self):
         # load pretrained models
@@ -143,6 +147,42 @@ class DiffusionEvaluator:
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
+    def _setup_learned_templates(self):
+        """Setup learned templates if template_path is provided"""
+        if self.args.template_path is not None:
+            print(f'Loading learned templates from {self.args.template_path}')
+            
+            # Load the saved template checkpoint
+            checkpoint = torch.load(self.args.template_path, map_location=self.device)
+            
+            # Extract template config and class names
+            template_config = checkpoint['template_config']
+            class_names = checkpoint['class_names']
+            
+            # Initialize template learner
+            self.template_learner = TemplateLearner(template_config, class_names).to(self.device)
+            
+            # Load the saved state
+            self.template_learner.load_state_dict(checkpoint['template_learner_state_dict'])
+            self.template_learner.eval()
+            
+            # Generate new text embeddings using learned templates
+            with torch.no_grad():
+                template_embeddings = self.template_learner.template_encoder(class_names)
+                # template_embeddings shape: [num_templates, num_classes, seq_len, embed_dim]
+                
+                # For now, use the first template (you could also implement template selection)
+                # or average across templates
+                self.learned_text_embeddings = template_embeddings[0]  # [num_classes, seq_len, embed_dim]
+                
+                # If you want to average across all templates:
+                # self.learned_text_embeddings = template_embeddings.mean(dim=0)  # [num_classes, seq_len, embed_dim]
+            
+            print(f'Loaded {template_config.num_templates} learned templates')
+            self.use_learned_templates = True
+        else:
+            self.use_learned_templates = False
+    
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
         scheduler_config = get_scheduler_config(args)
         T = scheduler_config['num_train_timesteps']
@@ -213,6 +253,9 @@ class DiffusionEvaluator:
                                 noise * ((1 - scheduler.alphas_cumprod[batch_ts]) ** 0.5).view(-1, 1, 1, 1).to(self.device)
                 t_input = batch_ts.to(self.device).half() if dtype == 'float16' else batch_ts.to(self.device)
                 text_input = text_embeds[text_embed_idxs[idx: idx + batch_size]]
+                if dtype == 'float16':
+                    text_input = text_input.half()
+                    noised_latent = noised_latent.half()
                 noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
                 if loss == 'l2':
                     error = F.mse_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
@@ -260,8 +303,25 @@ class DiffusionEvaluator:
                     img_input = img_input.half()
                 x0 = self.vae.encode(img_input).latent_dist.mean
                 x0 *= 0.18215
-            _,pred_idx, pred_errors = self.eval_prob_adaptive(self.unet, x0, self.text_embeddings, self.scheduler, self.args, self.latent_size, self.all_noise)
-            pred = self.prompts_df.classidx[pred_idx]
+            
+            # Use learned templates if available, otherwise use original prompts
+            if self.use_learned_templates:
+                text_embeddings_to_use = self.learned_text_embeddings
+            else:
+                text_embeddings_to_use = self.text_embeddings
+                
+            _,pred_idx, pred_errors = self.eval_prob_adaptive(
+                self.unet, x0, text_embeddings_to_use, self.scheduler, 
+                self.args, self.latent_size, self.all_noise
+            )
+            
+            if self.use_learned_templates:
+                # pred_idx directly corresponds to class index
+                pred = pred_idx
+            else:
+                # Use original logic with prompts_df
+                pred = self.prompts_df.classidx[pred_idx]
+                
             torch.save(dict(errors=pred_errors, pred=pred, label=label), fname)
             if pred == label:
                 correct += 1
@@ -294,6 +354,7 @@ def main():
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
     parser.add_argument('--loss', type=str, default='l2', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
+    parser.add_argument('--template_path', type=str, default=None, help='Path to trained templates')
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', type=int, required=True)

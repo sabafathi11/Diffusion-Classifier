@@ -281,6 +281,9 @@ class TemplateLearner(nn.Module):
         template_losses = []
         for t in range(num_templates):
             template_logits = logits[:, t, :]  # [batch_size, num_classes]
+            device = 'cuda' if template_logits.is_cuda else 'cpu'
+            template_logits = template_logits.to(device)
+            true_labels = true_labels.to(device)
             loss = F.cross_entropy(template_logits, true_labels)
             template_losses.append(loss)
         
