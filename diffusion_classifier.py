@@ -308,6 +308,7 @@ class DiffusionEvaluator:
                 text_embeddings_to_use = self.learned_text_embeddings
             else:
                 text_embeddings_to_use = self.text_embeddings
+                print(text_embeddings_to_use.shape)
                 
             _,pred_idx, pred_errors = self.eval_prob_adaptive(
                 self.unet, x0, text_embeddings_to_use, self.scheduler, 
@@ -341,7 +342,7 @@ def main():
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Number of trials per timestep')
     parser.add_argument('--batch_size', '-b', type=int, default=32)
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
-    parser.add_argument('--prompt_path', type=str, default=False, help='Path to csv file with prompts to use')
+    parser.add_argument('--prompt_path', type=str, default=None, help='Path to csv file with prompts to use')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
     parser.add_argument('--samples_per_class', type=int, default=None, help='Number of samples per class for balanced subset')
