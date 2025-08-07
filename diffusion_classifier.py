@@ -308,7 +308,6 @@ class DiffusionEvaluator:
                 text_embeddings_to_use = self.learned_text_embeddings
             else:
                 text_embeddings_to_use = self.text_embeddings
-                print(text_embeddings_to_use.shape)
                 
             _,pred_idx, pred_errors = self.eval_prob_adaptive(
                 self.unet, x0, text_embeddings_to_use, self.scheduler, 
