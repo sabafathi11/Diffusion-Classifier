@@ -85,7 +85,7 @@ python diffusion_integration.py \
 Evaluation with Learned Templates
 
 ```bash
-python diffusion_classifer.py \
+python diffusion_classifier.py \
     --dataset cifar10 \
     --split test \
     --prompt_path prompts/cifar10_prompts.csv \
