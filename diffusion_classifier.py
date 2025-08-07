@@ -81,8 +81,7 @@ class DiffusionEvaluator:
             self._setup_prompts()
         self._setup_noise()
         self._setup_run_folder()
-        if self.args.template_path is not None:
-            self._setup_learned_templates()
+        self._setup_learned_templates()
   
         
     def _setup_models(self):
