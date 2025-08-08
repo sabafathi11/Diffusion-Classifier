@@ -107,7 +107,7 @@ class HierarchicalCluster:
             n_clusters=None,
             metric='precomputed',
             distance_threshold=0,
-            linkage='complete',
+            linkage='average',
             compute_full_tree=True
         )
         clustering.fit(distance_matrix)
@@ -778,8 +778,6 @@ class DiffusionEvaluator:
         total = 0
         pbar = tqdm.tqdm(idxs_to_eval)
         for i in pbar:
-            if total > 0:
-                pbar.set_description(f'Acc: {100 * correct / total:.2f}%')
             fname = osp.join(self.run_folder, formatstr.format(i) + '.pt')
             if os.path.exists(fname):
                 print('Skipping', i)
@@ -800,6 +798,8 @@ class DiffusionEvaluator:
                     
                     correct += int(pred == label)
                     total += 1
+                if total > 0:
+                    pbar.set_description(f'Acc: {100 * correct / total:.2f}%')
                 continue
                 
             image, label = self.target_dataset[i]
@@ -844,6 +844,7 @@ class DiffusionEvaluator:
             if pred == label:
                 correct += 1
             total += 1
+            pbar.set_description(f'Acc: {100 * correct / total:.2f}%')
 
         # Generate analysis plots and summaries after evaluation
         print("\nGenerating analysis results...")
