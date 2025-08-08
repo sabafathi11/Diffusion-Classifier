@@ -74,7 +74,7 @@ python diffusion_integration.py \
     --n_samples 50 500 \
     --loss l1 \
     --n_trials 1 \
-    --num_templates 8 \
+    --num_templates 4 \
     --learning_rate 1e-3 \
     --num_epochs 10 \
     --batch_size 4 \

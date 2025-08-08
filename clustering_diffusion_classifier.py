@@ -75,8 +75,126 @@ def create_balanced_subset(dataset, samples_per_class):
     
     return sorted(balanced_indices)
 
-
 class HierarchicalCluster:
+    def __init__(self, class_names, max_depth=3, clip_model_name="ViT-B/32"):
+        self.class_names = class_names
+        self.max_depth = max_depth
+        self.clip_model_name = clip_model_name
+        self.tree = None
+        self.all_nodes = {}
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+    def build_tree(self):
+        """Build hierarchical clustering tree based on class names using CLIP embeddings."""
+        # Load CLIP model
+        model, _ = clip.load(self.clip_model_name, device=self.device)
+        model.eval()
+        
+        # Create CLIP embeddings from class names
+        with torch.no_grad():
+            # Tokenize class names
+            text_tokens = clip.tokenize(self.class_names).to(self.device)
+            # Get text embeddings
+            text_embeddings = model.encode_text(text_tokens)
+            # Normalize embeddings (CLIP embeddings are typically normalized)
+            text_embeddings = text_embeddings / text_embeddings.norm(dim=-1, keepdim=True)
+            # Convert to numpy for sklearn
+            embeddings = text_embeddings.cpu().numpy()
+        
+        # Perform hierarchical clustering
+        n_classes = len(self.class_names)
+        clustering = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=0,
+            linkage='ward',
+            compute_full_tree=True
+        )
+        
+        clustering.fit(embeddings)
+        
+        # Build tree structure
+        self.tree = self._build_tree_structure(clustering, n_classes)
+        print(f"Built hierarchical tree with {len(self.tree['children'])} top-level clusters using CLIP {self.clip_model_name}")
+        
+    def _build_tree_structure(self, clustering, n_classes):
+        """Build tree structure from sklearn clustering result."""
+        children = clustering.children_
+        
+        # Create all nodes
+        self.all_nodes = {}
+        
+        # Leaf nodes
+        for i in range(n_classes):
+            self.all_nodes[i] = {
+                'class_indices': [i],
+                'children': [],
+                'is_leaf': True,
+                'depth': 0
+            }
+        
+        # Internal nodes
+        for i, (left, right) in enumerate(children):
+            node_id = n_classes + i
+            self.all_nodes[node_id] = {
+                'class_indices': self.all_nodes[left]['class_indices'] + self.all_nodes[right]['class_indices'],
+                'children': [left, right],
+                'is_leaf': False,
+                'depth': max(self.all_nodes[left]['depth'], self.all_nodes[right]['depth']) + 1
+            }
+        
+        # Return root node
+        root_id = n_classes + len(children) - 1
+        return self.all_nodes[root_id]
+    
+    def get_clusters_at_depth(self, depth):
+        """Get all cluster nodes at a specific depth."""
+        if depth == 0:
+            return [self.tree]
+        
+        clusters = []
+        queue = [(self.tree, 0)]
+        
+        while queue:
+            node, current_depth = queue.pop(0)
+            
+            if current_depth == depth:
+                clusters.append(node)
+            elif current_depth < depth and not node['is_leaf']:
+                for child_id in node['children']:
+                    child_node = self._get_node_by_traversal(child_id)
+                    queue.append((child_node, current_depth + 1))
+        
+        return clusters
+    
+    def _get_node_by_traversal(self, node_id):
+        """Helper to get node by ID."""
+        return self.all_nodes[node_id]
+    
+    def save_tree(self, path):
+        """Save the tree structure to file."""
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'tree': self.tree, 
+                'class_names': self.class_names,
+                'all_nodes': self.all_nodes,
+                'clip_model_name': self.clip_model_name
+            }, f)
+    
+    def load_tree(self, path):
+        """Load the tree structure from file."""
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+            self.tree = data['tree']
+            self.class_names = data['class_names']
+            self.all_nodes = data['all_nodes']
+            # Handle backward compatibility
+            if 'clip_model_name' in data:
+                self.clip_model_name = data['clip_model_name']
+            else:
+                self.clip_model_name = "ViT-B/32"  # Default fallback
+                
+
+class HierarchicalClusterCosine:
     def __init__(self, class_names, max_depth=3, clip_model_name="ViT-B/32"):
         self.class_names = class_names
         self.max_depth = max_depth
@@ -919,7 +1037,7 @@ def main():
     # hierarchical clustering args
     parser.add_argument('--use_clustering', action='store_true', help='Enable hierarchical clustering')
     parser.add_argument('--cluster_depth', type=int, default=3, help='Maximum depth for hierarchical clustering')
-    parser.add_argument('--n_samples', nargs='+', type=int, default=[10, 100], help='Number of samples per depth (one integer per depth level)')
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[50, 500], help='Number of samples per depth (one integer per depth level)')
 
     args = parser.parse_args()
 

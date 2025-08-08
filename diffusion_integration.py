@@ -225,7 +225,7 @@ class DiffusionTemplateTrainer:
                 if accuracy > best_accuracy:
                     best_accuracy = accuracy
                     self.save_templates(epoch + 1)
-                    print(f"New best accuracy: {best_accuracy:.4f}")
+                    print(f"New best accuracy: {best_accuracy:.4f} at epoch {epoch + 1}")
             
             # Save checkpoint every few epochs
             if (epoch + 1) % self.args.save_interval == 0:
@@ -280,7 +280,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--max_train_samples', type=int, default=1000)
     parser.add_argument('--eval_interval', type=int, default=5)
-    parser.add_argument('--save_interval', type=int, default=10)
+    parser.add_argument('--save_interval', type=int, default=5)
     parser.add_argument('--save_dir', type=str, default='./trained_templates')
     
     args = parser.parse_args()

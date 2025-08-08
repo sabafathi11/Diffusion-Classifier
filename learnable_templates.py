@@ -11,7 +11,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 @dataclass
 class TemplateConfig:
     """Configuration for learnable templates"""
-    num_templates: int = 8
+    num_templates: int = 4 # Number of learnable templates
     template_dim: int = 1024  # Dimension of learned template embeddings
     text_encoder_dim: int = 1024  # CLIP text encoder dimension
     max_length: int = 77  # Max sequence length for CLIP
