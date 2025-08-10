@@ -1,6 +1,7 @@
 # Diffusion Classifier with Learnable Templates
 
 This repository extends the [diffusion-classifier](https://github.com/diffusion-classifier/diffusion-classifier) project with learnable template functionality for improved text-conditional image classification using diffusion models.
+
 This repository also contains two complementary approaches for improving diffusion-based image classification through hierarchical clustering: **Hierarchical Clustering** and **Beam Search**. Both methods leverage CLIP embeddings to organize class labels into semantic hierarchies and reduce computational costs during inference.
 
 ## Overview
@@ -8,6 +9,8 @@ This extension enhances the original diffusion-classifier by replacing static te
 The project implements two main approaches:
 1. **Standard Diffusion Classification**: Uses pre-defined text prompts to classify images based on diffusion model reconstruction errors
 2. **Learnable Templates**: Automatically learns optimal text templates that improve classification performance
+
+
 Moreover traditional diffusion-based classification evaluates all classes simultaneously, which can be computationally expensive for datasets with many classes. This project introduces two hierarchical approaches:
 
 1. **Hierarchical Clustering** : Uses a tree-based approach where classification decisions are made level by level, progressively narrowing down candidates.
@@ -19,19 +22,21 @@ Both approaches use CLIP embeddings to build semantic hierarchies of class label
 
 ```
 diffusion-classifier/
-├── diffusion_classifier.py          # Original classification script (enhanced)
-├── learnable_templates.py           # Core template learning modules
-├── diffusion_integration.py         # Template training script  
-├── diffusion/                       # Original diffusion utilities
+├── diffusion_classifier.py                 # Original classification script (enhanced)
+├── learnable_templates.py                  # Core template learning modules
+├── diffusion_integration.py                # Template training script  
+├── clustering_diffusion_classifier.py      # Hierarchical clustering modules
+├── beam_search_diffusion_classifier.py     # Hierarchical clustering using beam search modules
+├── diffusion/                              # Original diffusion utilities
 │   ├── datasets.py
 │   ├── models.py
 │   └── utils.py
-├── trained_templates/               # Saved template checkpoints
+├── trained_templates/                      # Saved template checkpoints
 │   └── templates_[dataset]/
 │       ├── best_templates.pt
 │       ├── templates_epoch_*.pt
 │       └── checkpoint_epoch_*.pt
-└── data/                           # Training and evaluation logs
+
 ```
 
 
@@ -40,6 +45,10 @@ diffusion-classifier/
 Create a conda environment with the following command:
 ```bash
 conda env create -f environment.yml
+```
+or create a virtual environment and use pip:
+```bash
+pip install -r requirements.txt
 ```
 
 ## Usage

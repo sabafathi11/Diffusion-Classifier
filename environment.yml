@@ -26,6 +26,7 @@ dependencies:
   - xformers::xformers
   - seaborn
   - cuda-nvcc
+  - scikit-learn
   - pip:
     - git+https://github.com/modestyachts/ImageNetV2_pytorch
     - datasets
