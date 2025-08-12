@@ -29,3 +29,8 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Pictures
+*.png
+*.jpg
+*.jpeg

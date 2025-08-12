@@ -13,11 +13,11 @@ import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 from collections import defaultdict
 
-# DAAM imports
-from daam import set_seed, trace
-from diffusers import StableDiffusionPipeline
-import matplotlib.pyplot as plt
-from PIL import Image
+
+# Import DAAM components
+from daam import trace, set_seed
+from diffusers import StableDiffusionXLImg2ImgPipeline
+from daam.heatmap import GlobalHeatMap
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -74,7 +74,7 @@ def create_balanced_subset(dataset, samples_per_class):
     return sorted(balanced_indices)
 
 
-class AttentionDiffusionEvaluator:
+class DAAMDiffusionClassifier:
     def __init__(self, args):
         self.args = args
         self.device = device
@@ -84,18 +84,19 @@ class AttentionDiffusionEvaluator:
         self._setup_dataset()
         if self.args.prompt_path is not None:
             self._setup_prompts()
+        self._setup_noise()
         self._setup_run_folder()
-        
-        # Set up DAAM pipeline
-        self._setup_daam_pipeline()
+
         
     def _setup_models(self):
-        # load pretrained models
-        self.vae, self.tokenizer, self.text_encoder, self.unet, self.scheduler = get_sd_model(self.args)
-        self.vae = self.vae.to(self.device)
-        self.text_encoder = self.text_encoder.to(self.device)
-        self.unet = self.unet.to(self.device)
-        torch.backends.cudnn.benchmark = True
+        # Create diffusion pipeline for DAAM using DiffusionPipeline like in the repo example
+        model_id = 'stabilityai/stable-diffusion-xl-base-1.0'  # You may want to make this configurable
+        self.pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant='fp16'
+        ).to(device)
         
     def _setup_dataset(self):
         # set up dataset
@@ -107,24 +108,21 @@ class AttentionDiffusionEvaluator:
     def _setup_prompts(self):
         self.prompts_df = pd.read_csv(self.args.prompt_path)
         
-        # Get text embeddings for all prompts
-        text_input = self.tokenizer(self.prompts_df.classname.tolist(), padding="max_length",
-                               max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
-        embeddings = []
-        with torch.inference_mode():
-            for i in range(0, len(text_input.input_ids), 100):
-                text_embeddings = self.text_encoder(
-                    text_input.input_ids[i: i + 100].to(self.device),
-                )[0]
-                embeddings.append(text_embeddings)
-        self.text_embeddings = torch.cat(embeddings, dim=0)
-        assert len(self.text_embeddings) == len(self.prompts_df)
+        # Use classname column for DAAM processing
+        self.class_names = self.prompts_df.classname.tolist()
         
+    def _setup_noise(self):
+        # load noise
+        if self.args.noise_path is not None:
+            assert not self.args.zero_noise
+            self.all_noise = torch.load(self.args.noise_path).to(self.device)
+            print('Loaded noise from', self.args.noise_path)
+        else:
+            self.all_noise = None
+            
     def _setup_run_folder(self):
         # make run output folder
-        name = f"attention_v{self.args.version}_"
-        name += f"t{self.args.attention_timesteps}_"
-        name += f"thresh{self.args.attention_threshold}"
+        name = f"daam_v{self.args.version}_{self.args.n_trials}trials"
         if self.args.interpolation != 'bicubic':
             name += f'_{self.args.interpolation}'
         if self.args.img_size != 512:
@@ -138,112 +136,74 @@ class AttentionDiffusionEvaluator:
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
-    def _setup_daam_pipeline(self):
-        """Setup DAAM pipeline for attention visualization"""
-        model_id = f"stabilityai/stable-diffusion-{self.args.version}"
-        self.daam_pipe = StableDiffusionPipeline.from_pretrained(
-            model_id, torch_dtype=torch.float16 if self.args.dtype == 'float16' else torch.float32
-        ).to(self.device)
-        
-    def get_attention_scores(self, image_tensor, prompts):
+
+
+    def compute_daam_scores(self, image, class_names):
         """
-        Get attention scores for each prompt on the given image
-        
-        Args:
-            image_tensor: preprocessed image tensor [1, 3, H, W] 
-            prompts: list of prompt strings
-            
-        Returns:
-            attention_scores: list of attention scores for each prompt
+        Compute DAAM heat map scores for each candidate class name.
+        Returns the total activation (sum of heat map values) for each class.
         """
-        # Convert tensor back to PIL for DAAM
-        # Denormalize: from [-1, 1] back to [0, 1]
-        img_denorm = (image_tensor.squeeze(0) + 1) / 2
-        img_denorm = torch.clamp(img_denorm, 0, 1)
+        # Convert tensor image back to PIL for DAAM processing
+        if isinstance(image, torch.Tensor):
+            # Denormalize and convert to PIL
+            image_pil = torch_transforms.ToPILImage()(image * 0.5 + 0.5)
+        else:
+            image_pil = image
         
-        # Convert to PIL
-        img_pil = torch_transforms.ToPILImage()(img_denorm.cpu())
-        
-        attention_scores = []
-        
-        for prompt in prompts:
+        daam_scores = []
+
+        prompt = ' '.join(class_names)
+
+        for class_name in class_names:
             try:
-                # Use DAAM to generate and trace attention
-                set_seed(42)  # For reproducibility
-                
-                with trace(self.daam_pipe) as tc:
-                    # Generate image with current prompt 
-                    # We use the original image as init_image for img2img-like behavior
-                    out = self.daam_pipe(
-                        prompt,
-                        num_inference_steps=self.args.attention_timesteps,
-                        generator=torch.Generator(device=self.device).manual_seed(42)
-                    )
-                    
-                # Get attention maps
-                # We want to see how much the prompt attends to the input
-                # Extract class name from prompt (assuming format like "a photo of a {class}")
-                words = prompt.split()
-                
-                # Try to identify the main noun/class word
-                # This is dataset dependent - you might need to adjust this logic
-                if "of a" in prompt:
-                    class_word_idx = words.index("a") + 1
-                    if class_word_idx < len(words):
-                        class_word = words[class_word_idx]
-                    else:
-                        class_word = words[-1]  # fallback to last word
-                else:
-                    class_word = words[-1]  # fallback to last word
-                    
-                # Get attention map for the class word
-                attention_map = tc.compute_global_heat_map()
-                
-                # Compute attention score as mean activation above threshold
-                if self.args.attention_method == 'mean':
-                    score = attention_map.mean().item()
-                elif self.args.attention_method == 'max':
-                    score = attention_map.max().item()
-                elif self.args.attention_method == 'above_threshold':
-                    score = (attention_map > self.args.attention_threshold).float().mean().item()
-                elif self.args.attention_method == 'weighted_sum':
-                    # Weight by attention values above threshold
-                    mask = attention_map > self.args.attention_threshold
-                    score = (attention_map * mask).sum().item()
-                else:
-                    score = attention_map.mean().item()
-                    
-                attention_scores.append(score)
-                
+                gen = set_seed(self.args.daam_seed)  # for reproducibility
+                with torch.no_grad():
+                    with trace(self.pipe) as tc:
+                        # Generate using the class name as prompt
+                        out = self.pipe(
+                            prompt=prompt,
+                            image=image_pil,
+                            strength=0.03,      # tiny value to avoid changes but keep pipeline working
+                            num_inference_steps=self.args.daam_steps,
+                            generator=gen
+                        )
+                            
+                        # Compute global heat map
+                        global_word_heat_map = tc.compute_global_heat_map()
+                        word_heat_map = global_word_heat_map.compute_word_heat_map(class_name)
+                            
+                        # Get the total activation as classification score
+                        heat_map_tensor = word_heat_map.heatmap
+
+                        # total_activation = float(heat_map_tensor.sum().item())
+
+                        threshold = 0.1
+                        attended_pixels = (heat_map_tensor >= threshold).sum()
+
+                        daam_scores.append(attended_pixels)
+                            
             except Exception as e:
-                print(f"Error processing prompt '{prompt}': {e}")
-                attention_scores.append(0.0)  # fallback score
-                
-        return attention_scores
-    
-    def classify_by_attention(self, image, prompts_to_use):
+                print(f"Error processing class '{class_name}': {e}")
+                daam_scores.append(0.0)  # Default to 0 if error
+                    
+        return torch.tensor(daam_scores)
+
+    def eval_daam_classification(self, image):
         """
-        Classify image based on attention scores
-        
-        Args:
-            image: preprocessed image tensor
-            prompts_to_use: list of prompts/class names to evaluate
-            
-        Returns:
-            pred_class_idx: predicted class index
-            all_scores: attention scores for all prompts
+        Evaluate using DAAM heat maps for all classes at once.
+        Returns DAAM scores for all classes and the predicted class index.
         """
-        # Add batch dimension if needed
-        if len(image.shape) == 3:
-            image = image.unsqueeze(0)
-            
-        # Get attention scores for all prompts
-        attention_scores = self.get_attention_scores(image, prompts_to_use)
+        # Compute DAAM scores for all class names
+        daam_scores = self.compute_daam_scores(image, self.class_names)
+
+        print('\n\n\n\n\n')
+        print(self.class_names)
+        print(daam_scores)
         
-        # Find the prompt/class with highest attention score
-        pred_class_idx = np.argmax(attention_scores)
+        # Find the class with highest activation
+        pred_idx = torch.argmin(daam_scores).item()
         
-        return pred_class_idx, attention_scores
+        return daam_scores, pred_idx
 
     def run_evaluation(self):
         # subset of dataset to evaluate
@@ -264,7 +224,7 @@ class AttentionDiffusionEvaluator:
         
         for i in pbar:
             if total > 0:
-                pbar.set_description(f'Acc: {100 * correct / total:.2f}%')
+                pbar.set_description(f'DAAM Acc: {100 * correct / total:.2f}%')
             fname = osp.join(self.run_folder, formatstr.format(i) + '.pt')
             if os.path.exists(fname):
                 print('Skipping', i)
@@ -275,25 +235,21 @@ class AttentionDiffusionEvaluator:
                 continue
                 
             image, label = self.target_dataset[i]
+
+            print(self.prompts_df[self.prompts_df['classidx'] == label]['classname'].values[0])
             
-            prompts_to_use = self.prompts_df.classname.tolist()
+            # Compute DAAM-based classification scores for all classes
+            daam_scores, pred_idx = self.eval_daam_classification(image)
             
-            # Classify based on attention
-            pred_idx, attention_scores = self.classify_by_attention(image, prompts_to_use)
-            
-            pred = self.prompts_df.classidx.iloc[pred_idx]
+            # Get predicted class from CSV mapping
+            pred = self.prompts_df.classidx[pred_idx]
                 
-            # Save results
-            torch.save({
-                'attention_scores': attention_scores,
-                'pred': pred,
-                'label': label,
-                'pred_idx': pred_idx
-            }, fname)
-            
+            torch.save(dict(daam_scores=daam_scores, pred=pred, label=label), fname)
             if pred == label:
                 correct += 1
             total += 1
+
+        print(f'Final DAAM Classification Accuracy: {100 * correct / total:.2f}%')
 
 
 def main():
@@ -305,35 +261,30 @@ def main():
                                  'objectnet', 'aircraft'], help='Dataset to use')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
 
-    # model args
+    # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
+    parser.add_argument('--batch_size', '-b', type=int, default=32)
+    parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
+    parser.add_argument('--prompt_path', type=str, default=None, help='Path to csv file with prompts to use')
+    parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
+    parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
+    parser.add_argument('--samples_per_class', type=int, default=None, help='Number of samples per class for balanced subset')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
                         help='Model data type to use')
     parser.add_argument('--interpolation', type=str, default='bicubic', help='Resize interpolation type')
-
-    # attention-specific args
-    parser.add_argument('--attention_timesteps', type=int, default=20, help='Number of timesteps for attention computation')
-    parser.add_argument('--attention_threshold', type=float, default=0.1, help='Threshold for attention map')
-    parser.add_argument('--attention_method', type=str, default='mean', 
-                        choices=['mean', 'max', 'above_threshold', 'weighted_sum'],
-                        help='Method to compute attention scores')
-
-    # data args
-    parser.add_argument('--prompt_path', type=str, default=None, help='Path to csv file with prompts to use')
-    parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
-    parser.add_argument('--samples_per_class', type=int, default=None, help='Number of samples per class for balanced subset')
-
-    # run args
     parser.add_argument('--extra', type=str, default=None, help='To append to the run folder name')
     parser.add_argument('--n_workers', type=int, default=1, help='Number of workers to split the dataset across')
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
+    # DAAM-specific args
+    parser.add_argument('--daam_steps', type=int, default=100, help='Number of inference steps for DAAM')
+    parser.add_argument('--daam_seed', type=int, default=0, help='Seed for DAAM generation')
 
     args = parser.parse_args()
 
     # Create evaluator and run
-    evaluator = AttentionDiffusionEvaluator(args)
+    evaluator = DAAMDiffusionClassifier(args)
     evaluator.run_evaluation()
 
 
