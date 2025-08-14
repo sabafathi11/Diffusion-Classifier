@@ -390,13 +390,20 @@ class DiffusionEvaluator:
                 clusters_at_depth = self.hierarchical_cluster.get_clusters_at_depth(depth)
                 relevant_clusters = []
                 
+                # inside eval_prob_beam_search, where you build relevant_clusters
                 for cluster in clusters_at_depth:
                     cluster_classes = [idx for idx in cluster['class_indices'] if idx in beam_candidates]
                     if cluster_classes:
+                        # recompute centroid and representative within the subset
+                        subset_embs = self.hierarchical_cluster.embeddings[cluster_classes]
+                        centroid = subset_embs.mean(axis=0, keepdims=True)
+                        dists = np.linalg.norm(subset_embs - centroid, axis=1)
+                        rep_in_subset = cluster_classes[int(np.argmin(dists))]
                         relevant_clusters.append({
                             'class_indices': cluster_classes,
-                            'representative_idx': cluster['centroid_index']  # Use centroid as representative
+                            'representative_idx': rep_in_subset
                         })
+
                 
                 if len(relevant_clusters) <= 1:
                     # No meaningful splitting, keep current candidates

@@ -136,56 +136,70 @@ class DAAMDiffusionClassifier:
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
+    def gaussian_center_weights_torch(self, H, W, sigma=0.35, device="cuda"):
+        # Create meshgrid in torch
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij"
+        )
+        cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
+        sy, sx = sigma * H, sigma * W
+        w = torch.exp(-(((ys - cy) ** 2) / (2 * sy ** 2) + ((xs - cx) ** 2) / (2 * sx ** 2)))
+        return w
 
+    def gaussian_center_score_torch(self, hm, sigma=0.35, top_percent=0.1):
+        # hm is a torch.Tensor on the correct device
+        H, W = hm.shape
+        device = hm.device
+        w = self.gaussian_center_weights_torch(H, W, sigma, device)
+        weighted = hm * w
+
+        if top_percent is None:
+            # Weighted mean
+            return weighted.sum() / (w.sum() + 1e-8)
+
+        flat = weighted.view(-1)
+        thr = torch.quantile(flat, 1 - top_percent)
+        return flat[flat >= thr].mean()
 
     def compute_daam_scores(self, image, class_names):
-        """
-        Compute DAAM heat map scores for each candidate class name.
-        Returns the total activation (sum of heat map values) for each class.
-        """
-        # Convert tensor image back to PIL for DAAM processing
         if isinstance(image, torch.Tensor):
-            # Denormalize and convert to PIL
             image_pil = torch_transforms.ToPILImage()(image * 0.5 + 0.5)
         else:
             image_pil = image
         
         daam_scores = []
-
         prompt = ' '.join(class_names)
 
         for class_name in class_names:
             try:
-                gen = set_seed(self.args.daam_seed)  # for reproducibility
+                gen = set_seed(self.args.daam_seed)
                 with torch.no_grad():
                     with trace(self.pipe) as tc:
-                        # Generate using the class name as prompt
                         out = self.pipe(
                             prompt=prompt,
                             image=image_pil,
-                            strength=0.03,      # tiny value to avoid changes but keep pipeline working
+                            strength=0.03,
                             num_inference_steps=self.args.daam_steps,
                             generator=gen
                         )
-                            
-                        # Compute global heat map
-                        global_word_heat_map = tc.compute_global_heat_map()
-                        word_heat_map = global_word_heat_map.compute_word_heat_map(class_name)
-                            
-                        # Get the total activation as classification score
-                        heat_map_tensor = word_heat_map.heatmap
 
-                        # total_activation = float(heat_map_tensor.sum().item())
+                        heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
+                        hm = heat_map.heatmap  # already a torch.Tensor on GPU
 
-                        threshold = 0.1
-                        attended_pixels = (heat_map_tensor >= threshold).sum()
+                        # Normalize (1–99 percentile in torch)
+                        lo = torch.quantile(hm, 0.01)
+                        hi = torch.quantile(hm, 0.99)
+                        hm = torch.clamp((hm - lo) / (hi - lo + 1e-8), 0, 1)
 
-                        daam_scores.append(attended_pixels)
-                            
+                        # Score with Gaussian center weighting
+                        score = self.gaussian_center_score_torch(hm, sigma=0.15, top_percent=0.05)
+
+                        daam_scores.append(float(score))
+
             except Exception as e:
-                print(f"Error processing class '{class_name}': {e}")
-                daam_scores.append(0.0)  # Default to 0 if error
-                    
+                print(f"Error processing class {class_name}: {e}")
+                daam_scores.append( -float('inf'))
+
         return torch.tensor(daam_scores)
 
     def eval_daam_classification(self, image):
@@ -201,7 +215,7 @@ class DAAMDiffusionClassifier:
         print(daam_scores)
         
         # Find the class with highest activation
-        pred_idx = torch.argmin(daam_scores).item()
+        pred_idx = torch.argmax(daam_scores).item()
         
         return daam_scores, pred_idx
 
