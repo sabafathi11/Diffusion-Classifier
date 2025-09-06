@@ -13,6 +13,13 @@ import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 from collections import defaultdict
 from learnable_templates import TemplateLearner, TemplateConfig, TemplateTextEncoder
+from diffusers import StableDiffusionXLImg2ImgPipeline
+from daam import trace, set_seed
+
+# Additional imports for analysis functions
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -81,6 +88,11 @@ class DiffusionEvaluator:
         self.args = args
         self.device = device
         
+        # Initialize result tracking
+        self.all_predictions = []
+        self.all_labels = []
+        self.classidx_to_name = {}
+        
         # Set up models and other components
         self._setup_models()
         self._setup_dataset()
@@ -98,6 +110,12 @@ class DiffusionEvaluator:
         self.text_encoder = self.text_encoder.to(self.device)
         self.unet = self.unet.to(self.device)
         torch.backends.cudnn.benchmark = True
+        self.daam_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+            'stabilityai/stable-diffusion-xl-base-1.0',
+            torch_dtype=torch.float16,
+            use_safetensors=True,
+            variant='fp16',
+        ).to(self.device)
         
     def _setup_dataset(self):
         # set up dataset
@@ -108,6 +126,10 @@ class DiffusionEvaluator:
         
     def _setup_prompts(self):
         self.prompts_df = pd.read_csv(self.args.prompt_path)
+        
+        # Build class index to name mapping
+        for _, row in self.prompts_df.iterrows():
+            self.classidx_to_name[row['classidx']] = row['classname']
         
         # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L276
         text_input = self.tokenizer(self.prompts_df.prompt.tolist(), padding="max_length",
@@ -189,7 +211,59 @@ class DiffusionEvaluator:
         else:
             self.use_learned_templates = False
     
-    def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
+
+    def gaussian_center_weights_torch(self, H, W, sigma=0.15, device="cuda"):
+        # Create meshgrid in torch
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij"
+        )
+        cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
+        sy, sx = sigma * H, sigma * W
+        w = torch.exp(-(((ys - cy) ** 2) / (2 * sy ** 2) + ((xs - cx) ** 2) / (2 * sx ** 2)))
+        return w
+
+    def gaussian_center_mask_torch(self, hm, sigma=0.15, threshold=0.15):
+        H, W = hm.shape
+        device = hm.device
+        
+        # Get Gaussian weights
+        w = self.gaussian_center_weights_torch(H, W, sigma, device)
+        
+        # Create binary mask based on threshold
+        mask = (w >= threshold).float()
+        
+        # Apply mask to heatmap (keeps original values where mask=1, sets to 0 elsewhere)
+        masked_hm = hm * mask
+        
+        return masked_hm
+
+    def compute_attended_pixels(self, image, class_names, class_name):
+        if isinstance(image, torch.Tensor):
+            image_pil = torch_transforms.ToPILImage()(image * 0.5 + 0.5)
+        else:
+            image_pil = image
+        prompt = ' '.join(class_names)
+
+        gen = set_seed(0)
+        with torch.no_grad():
+            with trace(self.daam_pipe) as tc:
+                out = self.daam_pipe(
+                    prompt=prompt,
+                    image=image_pil,
+                    strength=0.03,
+                    num_inference_steps=100,
+                    generator=gen
+                )
+
+                heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
+                hm = heat_map.heatmap  # already a torch.Tensor on GPU
+
+                attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.15, threshold=0.15)
+                
+        print()
+        return attended_pixels
+
+    def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None, attended_mask=None):
         scheduler_config = get_scheduler_config(args)
         T = scheduler_config['num_train_timesteps']
         max_n_samples = max(args.n_samples)
@@ -219,7 +293,7 @@ class DiffusionEvaluator:
                     text_embed_idxs.extend([prompt_i] * args.n_trials)
             t_evaluated.update(curr_t_to_eval)
             pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss)
+                                    text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, attended_mask)
             # match up computed errors to the data
             for prompt_i in remaining_prmpt_idxs:
                 mask = torch.tensor(text_embed_idxs) == prompt_i
@@ -247,12 +321,19 @@ class DiffusionEvaluator:
         return all_losses,pred_idx, data
 
     def eval_error(self, unet, scheduler, latent, all_noise, ts, noise_idxs,
-                   text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2'):
+                text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2', 
+                attended_mask=None):
         assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
         pred_errors = torch.zeros(len(ts), device='cpu')
         idx = 0
+        
+        # Create nested progress bar with proper positioning and disable if parent exists
+        batch_count = len(ts) // batch_size + int(len(ts) % batch_size != 0)
+        batch_pbar = tqdm.tqdm(total=batch_count, desc="Processing batches", 
+                              position=1, leave=False, disable=batch_count < 5)
+        
         with torch.inference_mode():
-            for _ in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
+            for batch_idx in range(batch_count):
                 batch_ts = torch.tensor(ts[idx: idx + batch_size])
                 noise = all_noise[noise_idxs[idx: idx + batch_size]]
                 noised_latent = latent * (scheduler.alphas_cumprod[batch_ts] ** 0.5).view(-1, 1, 1, 1).to(self.device) + \
@@ -262,18 +343,139 @@ class DiffusionEvaluator:
                 if dtype == 'float16':
                     text_input = text_input.half()
                     noised_latent = noised_latent.half()
-                noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
+                noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample  
                 if loss == 'l2':
-                    error = F.mse_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+                    error = F.mse_loss(noise, noise_pred, reduction='none')
                 elif loss == 'l1':
-                    error = F.l1_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+                    error = F.l1_loss(noise, noise_pred, reduction='none')
                 elif loss == 'huber':
-                    error = F.huber_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+                    error = F.huber_loss(noise, noise_pred, reduction='none')
                 else:
                     raise NotImplementedError
+                
+                # Apply attended pixels mask if provided
+                if attended_mask is not None:
+                    # attended_mask is [H, W] with values in {0,1}
+                    mask = attended_mask.float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+                    
+                    # Compute pooling kernel and stride based on input/output size
+                    H, W = attended_mask.shape
+                    target_size = self.latent_size
+                    kernel_size_h = H // target_size
+                    kernel_size_w = W // target_size
+                    
+                    # Apply average pooling
+                    latent_mask = F.avg_pool2d(mask, kernel_size=(kernel_size_h, kernel_size_w),
+                          stride=(kernel_size_h, kernel_size_w))
+                    
+                    # Expand to match error dimensions [batch_size, 4, 64, 64]
+                    latent_mask = latent_mask.expand(error.size(0), 4, -1, -1).to(error.device)
+                    
+                    # Apply mask
+                    error = error * latent_mask
+
+                # Compute mean error per sample
+                error = error.mean(dim=(1, 2, 3))
                 pred_errors[idx: idx + len(batch_ts)] = error.detach().cpu()
                 idx += len(batch_ts)
+                
+                batch_pbar.update(1)
+        
+        batch_pbar.close()
         return pred_errors
+
+    def plot_confusion_matrix(self, save_path=None):
+        """Generate and save confusion matrix plot."""
+        if len(self.all_predictions) == 0 or len(self.all_labels) == 0:
+            print("No predictions available for confusion matrix")
+            return
+        
+        # Get unique class labels and their names
+        unique_labels = sorted(list(set(self.all_labels + self.all_predictions)))
+        class_names = [self.classidx_to_name.get(label, str(label)) for label in unique_labels]
+        
+        # Compute confusion matrix
+        cm = confusion_matrix(self.all_labels, self.all_predictions, labels=unique_labels)
+        
+        # Create figure
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=class_names, yticklabels=class_names)
+        plt.title('Confusion Matrix')
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Confusion matrix saved to {save_path}")
+        else:
+            plt.savefig(osp.join(self.run_folder, 'confusion_matrix.png'), dpi=300, bbox_inches='tight')
+            print(f"Confusion matrix saved to {osp.join(self.run_folder, 'confusion_matrix.png')}")
+        plt.close()
+        
+        # Save classification report
+        report = classification_report(self.all_labels, self.all_predictions, 
+                                     labels=unique_labels, target_names=class_names)
+        report_path = osp.join(self.run_folder, 'classification_report.txt')
+        with open(report_path, 'w') as f:
+            f.write(report)
+        print(f"Classification report saved to {report_path}")
+
+    def save_results_summary(self):
+        """Save a comprehensive summary of results."""
+        if len(self.all_predictions) == 0 or len(self.all_labels) == 0:
+            print("No results to summarize")
+            return
+            
+        summary_path = osp.join(self.run_folder, 'results_summary.txt')
+        with open(summary_path, 'w') as f:
+            f.write("Diffusion Classification Results Summary\n")
+            f.write("=======================================\n\n")
+            
+            # Overall accuracy
+            correct = sum(1 for p, l in zip(self.all_predictions, self.all_labels) if p == l)
+            total = len(self.all_predictions)
+            accuracy = (correct / total * 100) if total > 0 else 0
+            
+            f.write(f"Overall Results:\n")
+            f.write(f"Total samples: {total}\n")
+            f.write(f"Correct predictions: {correct}\n")
+            f.write(f"Accuracy: {accuracy:.2f}%\n\n")
+            
+            # Diffusion model configuration
+            f.write(f"Model Configuration:\n")
+            f.write(f"Version: {self.args.version}\n")
+            f.write(f"Image size: {self.args.img_size}\n")
+            f.write(f"Batch size: {self.args.batch_size}\n")
+            f.write(f"Number of trials: {self.args.n_trials}\n")
+            f.write(f"Loss function: {self.args.loss}\n")
+            f.write(f"Data type: {self.args.dtype}\n")
+            f.write(f"Interpolation: {self.args.interpolation}\n")
+            if self.args.template_path:
+                f.write(f"Using learned templates: {self.args.template_path}\n")
+            f.write(f"Adaptive sampling - n_samples: {self.args.n_samples}\n")
+            f.write(f"Adaptive sampling - to_keep: {self.args.to_keep}\n\n")
+            
+            # Per-class accuracy if we have class names
+            if hasattr(self, 'classidx_to_name') and len(self.classidx_to_name) > 0:
+                f.write("Per-class Results:\n")
+                class_stats = {}
+                for true_label, pred_label in zip(self.all_labels, self.all_predictions):
+                    if true_label not in class_stats:
+                        class_stats[true_label] = {'total': 0, 'correct': 0}
+                    class_stats[true_label]['total'] += 1
+                    if true_label == pred_label:
+                        class_stats[true_label]['correct'] += 1
+                
+                for class_idx, stats in sorted(class_stats.items()):
+                    class_name = self.classidx_to_name.get(class_idx, str(class_idx))
+                    class_acc = (stats['correct'] / stats['total'] * 100) if stats['total'] > 0 else 0
+                    f.write(f"{class_name}: {stats['correct']}/{stats['total']} ({class_acc:.1f}%)\n")
+        
+        print(f"Results summary saved to {summary_path}")
 
     def run_evaluation(self):
         # subset of dataset to evaluate
@@ -290,18 +492,29 @@ class DiffusionEvaluator:
         formatstr = get_formatstr(len(self.target_dataset) - 1)
         correct = 0
         total = 0
-        pbar = tqdm.tqdm(idxs_to_eval)
+        
+        # Main progress bar with better formatting
+        pbar = tqdm.tqdm(idxs_to_eval, desc="Evaluating samples", position=0)
+        
         for i in pbar:
-            if total > 0:
-                pbar.set_description(f'Acc: {100 * correct / total:.2f}%')
             fname = osp.join(self.run_folder, formatstr.format(i) + '.pt')
+            
+            # Update progress bar description with current stats
+            if total > 0:
+                acc = 100 * correct / total
+                pbar.set_description(f'Accuracy: {acc:.2f}% ({correct}/{total})')
+                print()
+            
             if os.path.exists(fname):
-                print('Skipping', i)
                 if self.args.load_stats:
                     data = torch.load(fname)
                     correct += int(data['pred'] == data['label'])
                     total += 1
+                    # Add to tracking lists
+                    self.all_predictions.append(data['pred'])
+                    self.all_labels.append(data['label'])
                 continue
+                
             image, label = self.target_dataset[i]
             with torch.no_grad():
                 img_input = image.to(self.device).unsqueeze(0)
@@ -315,10 +528,17 @@ class DiffusionEvaluator:
                 text_embeddings_to_use = self.learned_text_embeddings
             else:
                 text_embeddings_to_use = self.text_embeddings
-                
+            
+            class_names = self.prompts_df.classname.tolist()
+            class_name = class_names[label]
+            attended_mask = self.compute_attended_pixels(image, class_names, class_name)
+
+            print()
+
+            # Then modify the eval_prob_adaptive call to pass the mask down
             _,pred_idx, pred_errors = self.eval_prob_adaptive(
                 self.unet, x0, text_embeddings_to_use, self.scheduler, 
-                self.args, self.latent_size, self.all_noise
+                self.args, self.latent_size, self.all_noise, attended_mask
             )
             
             if self.use_learned_templates:
@@ -329,9 +549,27 @@ class DiffusionEvaluator:
                 pred = self.prompts_df.classidx[pred_idx]
                 
             torch.save(dict(errors=pred_errors, pred=pred, label=label), fname)
+            
+            # Add to tracking lists
+            self.all_predictions.append(pred)
+            self.all_labels.append(label)
+            
             if pred == label:
                 correct += 1
             total += 1
+
+            print()
+        
+        # Final accuracy summary
+        if total > 0:
+            final_acc = 100 * correct / total
+            print(f'\nFinal Accuracy: {final_acc:.2f}% ({correct}/{total})')
+            
+            # Generate analysis plots and summaries
+            print("\nGenerating analysis results...")
+            self.plot_confusion_matrix()
+            self.save_results_summary()
+            print("Analysis complete!")
 
 
 def main():

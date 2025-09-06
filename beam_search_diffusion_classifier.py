@@ -360,6 +360,22 @@ class DiffusionEvaluator:
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
+    def get_scaled_closeness(scores, min_output=50, max_output=500, mean=0.5, std_dev=0.5):
+
+        # Calculate variance
+        variance = torch.var(scores)
+        
+        # Calculate closeness
+        closeness = 1 / (1 + variance)
+        
+        # Calculate Gaussian probability density
+        gaussian_value = torch.exp(-0.5 * ((closeness - mean) / std_dev) ** 2)
+        
+        # Scale to desired output range
+        scaled_closeness = min_output + (max_output - min_output) * gaussian_value
+        
+        return scaled_closeness
+
     def eval_prob_beam_search(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
         """Evaluate probabilities using beam search with hierarchical clustering."""
         scheduler_config = get_scheduler_config(args)
@@ -409,7 +425,11 @@ class DiffusionEvaluator:
                     # No meaningful splitting, keep current candidates
                     new_beam.append((beam_candidates, beam_score))
                     continue
-                
+                #print(beam_score)
+                scaled_closeness = int(self.get_scaled_closeness(beam_score))
+
+                #n_samples_at_depth = scaled_closeness
+
                 # Evaluate representative classes from each cluster
                 cluster_representatives = [cluster['representative_idx'] for cluster in relevant_clusters]
                 
@@ -825,9 +845,9 @@ def main():
 
     # beam search clustering args
     parser.add_argument('--use_clustering', action='store_true', help='Enable beam search with hierarchical clustering')
-    parser.add_argument('--cluster_depth', type=int, default=3, help='Maximum depth for hierarchical clustering')
-    parser.add_argument('--beam_width', type=int, default=2, help='Beam width for beam search (number of branches to keep)')
-    parser.add_argument('--n_samples', nargs='+', type=int, default=[10, 200, 200], help='Number of samples per depth (one integer per depth level)')
+    parser.add_argument('--cluster_depth', type=int, default=4, help='Maximum depth for hierarchical clustering')
+    parser.add_argument('--beam_width', type=int, default=4, help='Beam width for beam search (number of branches to keep)')
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[10, 10, 10, 10, 500], help='Number of samples per depth (one integer per depth level)')
 
     args = parser.parse_args()
 
