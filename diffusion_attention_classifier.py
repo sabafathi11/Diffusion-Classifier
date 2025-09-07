@@ -212,22 +212,22 @@ class DiffusionEvaluator:
             self.use_learned_templates = False
     
 
-    def gaussian_center_weights_torch(self, H, W, sigma=0.15, device="cuda"):
+    def gaussian_center_weights_torch(self, hm, H, W, sigma, device="cuda"):
         # Create meshgrid in torch
         ys, xs = torch.meshgrid(
             torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij"
         )
-        cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
-        sy, sx = sigma * H, sigma * W
+        cx, cy = hm.mean(axis=0), hm.mean(axis=1)  # center of mass
+        sx, sy = sigma * H, sigma * W
         w = torch.exp(-(((ys - cy) ** 2) / (2 * sy ** 2) + ((xs - cx) ** 2) / (2 * sx ** 2)))
         return w
 
-    def gaussian_center_mask_torch(self, hm, sigma=0.15, threshold=0.15):
+    def gaussian_center_mask_torch(self, hm, sigma, threshold):
         H, W = hm.shape
         device = hm.device
         
         # Get Gaussian weights
-        w = self.gaussian_center_weights_torch(H, W, sigma, device)
+        w = self.gaussian_center_weights_torch(hm, H, W, sigma, device)
         
         # Create binary mask based on threshold
         mask = (w >= threshold).float()
@@ -258,7 +258,7 @@ class DiffusionEvaluator:
                 heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
                 hm = heat_map.heatmap  # already a torch.Tensor on GPU
 
-                attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.15, threshold=0.15)
+                attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.1)
                 
         print()
         return attended_pixels
