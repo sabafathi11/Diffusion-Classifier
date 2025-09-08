@@ -20,6 +20,7 @@ from daam import trace, set_seed
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
+import cv2
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -237,6 +238,64 @@ class DiffusionEvaluator:
         
         return masked_hm
 
+    def visualize_mask_on_image(self, image, mask, class_name, save_path=None):
+        """
+        Visualize the mask overlaid on the original image
+        
+        Args:
+            image: Original image (PIL Image or torch.Tensor)
+            mask: Attention mask (torch.Tensor)
+            class_name: Name of the class being attended to
+            save_path: Optional path to save the visualization
+        """
+        # Convert image to numpy array
+        if isinstance(image, torch.Tensor):
+            # Denormalize if needed (assuming normalized to [-1, 1])
+            image_np = (image * 0.5 + 0.5).cpu().numpy()
+            if image_np.shape[0] == 3:  # CHW format
+                image_np = np.transpose(image_np, (1, 2, 0))
+        else:
+            image_np = np.array(image) / 255.0
+        
+        # Convert mask to numpy and resize to match image dimensions
+        mask_np = mask.cpu().numpy()
+        if mask_np.shape != image_np.shape[:2]:
+            mask_np = cv2.resize(mask_np, (image_np.shape[1], image_np.shape[0]))
+        
+        # Create visualization
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        
+        # Original image
+        axes[0].imshow(image_np)
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+        
+        # Mask heatmap
+        mask_plot = axes[1].imshow(mask_np, cmap='jet', alpha=0.8)
+        axes[1].set_title(f'Attention Mask for "{class_name}"')
+        axes[1].axis('off')
+        plt.colorbar(mask_plot, ax=axes[1], fraction=0.046, pad=0.04)
+        
+        # Overlay visualization
+        axes[2].imshow(image_np)
+        axes[2].imshow(mask_np, cmap='jet', alpha=0.5)
+        axes[2].set_title('Mask Overlay')
+        axes[2].axis('off')
+        
+        # Binary mask visualization
+        binary_mask = (mask_np > 0).astype(float)
+        axes[3].imshow(image_np)
+        axes[3].imshow(binary_mask, cmap='Reds', alpha=0.3)
+        axes[3].set_title('Binary Mask Overlay')
+        axes[3].axis('off')
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        plt.show()
+
     def compute_attended_pixels(self, image, class_names, class_name):
         if isinstance(image, torch.Tensor):
             image_pil = torch_transforms.ToPILImage()(image * 0.5 + 0.5)
@@ -260,10 +319,20 @@ class DiffusionEvaluator:
 
                 attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.1)
                 
+                # Add visualization here
+                print(f"Visualizing attention mask for class: {class_name}")
+                self.visualize_mask_on_image(
+                    image=image, 
+                    mask=attended_pixels, 
+                    class_name=class_name,
+                    save_path=f"attention_mask_{class_name}.png"  # Optional: save visualization
+                )
+                
         print()
         return attended_pixels
-
-    def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None, attended_mask=None):
+    
+    def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, class_names, class_name,
+                            latent_size=64, all_noise=None):
         scheduler_config = get_scheduler_config(args)
         T = scheduler_config['num_train_timesteps']
         max_n_samples = max(args.n_samples)
@@ -292,6 +361,7 @@ class DiffusionEvaluator:
                     noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
                     text_embed_idxs.extend([prompt_i] * args.n_trials)
             t_evaluated.update(curr_t_to_eval)
+            attended_mask = self.compute_attended_pixels(image, class_names, class_name)
             pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, attended_mask)
             # match up computed errors to the data
@@ -494,7 +564,7 @@ class DiffusionEvaluator:
         total = 0
         
         # Main progress bar with better formatting
-        pbar = tqdm.tqdm(idxs_to_eval, desc="Evaluating samples", position=0)
+        pbar = tqdm.tqdm(idxs_to_eval, position=0)
         
         for i in pbar:
             fname = osp.join(self.run_folder, formatstr.format(i) + '.pt')
@@ -531,14 +601,13 @@ class DiffusionEvaluator:
             
             class_names = self.prompts_df.classname.tolist()
             class_name = class_names[label]
-            attended_mask = self.compute_attended_pixels(image, class_names, class_name)
 
             print()
 
             # Then modify the eval_prob_adaptive call to pass the mask down
             _,pred_idx, pred_errors = self.eval_prob_adaptive(
                 self.unet, x0, text_embeddings_to_use, self.scheduler, 
-                self.args, self.latent_size, self.all_noise, attended_mask
+                self.args, self.latent_size, self.all_noise, image, class_names, class_name
             )
             
             if self.use_learned_templates:
