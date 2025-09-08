@@ -218,7 +218,8 @@ class DiffusionEvaluator:
         ys, xs = torch.meshgrid(
             torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij"
         )
-        cx, cy = hm.mean(axis=0), hm.mean(axis=1)  # center of mass
+        cx = (hm * torch.arange(W, device=device)).sum() / hm.sum()
+        cy = (hm * torch.arange(H, device=device)[:, None]).sum() / hm.sum()
         sx, sy = sigma * H, sigma * W
         w = torch.exp(-(((ys - cy) ** 2) / (2 * sy ** 2) + ((xs - cx) ** 2) / (2 * sx ** 2)))
         return w
@@ -238,7 +239,7 @@ class DiffusionEvaluator:
         
         return masked_hm
 
-    def visualize_mask_on_image(self, image, heat_map, mask, save_path=None):
+    def visualize_mask_on_image(self, image, heat_map, out, mask, save_path=None):
 
         # Convert image to numpy array
         if isinstance(image, torch.Tensor):
@@ -262,23 +263,19 @@ class DiffusionEvaluator:
         axes[0].set_title('Original Image')
         axes[0].axis('off')
 
-        heat_map.plot_overlay(image_np, ax=axes[1])
+        heat_map.plot_overlay(out.images[0], ax=axes[1])
         axes[1].set_title('Heatmap Overlay')
         axes[1].axis('off')
         
         # Overlay visualization
         axes[2].imshow(image_np)
-        axes[2].imshow(mask_np, cmap='jet', alpha=0.3)
+        axes[2].imshow(mask_np, alpha=0.5)
         axes[2].set_title('Mask Overlay')
         axes[2].axis('off')
         
-        
         plt.tight_layout()
-        
         if save_path:
             plt.savefig(osp.join(self.run_folder, save_path), dpi=300, bbox_inches='tight')
-        
-        plt.show()
 
     def compute_attended_pixels(self, image, class_names, class_name, true_class):
         if isinstance(image, torch.Tensor):
@@ -309,7 +306,8 @@ class DiffusionEvaluator:
         os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
         self.visualize_mask_on_image(
             image=image,
-            heat_map = heat_map, 
+            heat_map=heat_map,
+            out=out,
             mask=attended_pixels,
             save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
         )
@@ -338,18 +336,17 @@ class DiffusionEvaluator:
             ts = []
             noise_idxs = []
             text_embed_idxs = []
-            attended_masks = []
+            attended_masks = [self.compute_attended_pixels(image, class_names, class_names[i], true_class=class_name)
+                              for i in range(len(class_names))]
+            attended_masks = torch.stack(attended_masks, dim=0)  # [num_prompts, H, W]
             curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
             curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
             for prompt_i in remaining_prmpt_idxs:
-                print('evaluating error for label',class_names[prompt_i])
                 for t_idx, t in enumerate(curr_t_to_eval, start=len(t_evaluated)):
                     ts.extend([t] * args.n_trials)
                     noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
                     text_embed_idxs.extend([prompt_i] * args.n_trials)
-                attended_mask = self.compute_attended_pixels(image, class_names, class_names[prompt_i], true_class=class_name)
             t_evaluated.update(curr_t_to_eval)
-            attended_masks.append(attended_mask)
             pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, attended_masks)
             # match up computed errors to the data
@@ -412,22 +409,20 @@ class DiffusionEvaluator:
                     raise NotImplementedError
                 
                 # Apply attended pixels mask if provided
-                if attended_masks[text_embed_idxs[idx: idx + batch_size]] is not None:
+                if attended_masks is not None:
                     # attended_mask is [H, W] with values in {0,1}
-                    mask = attended_masks[batch_idx].float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-                    
+                    mask = attended_masks[text_embed_idxs[idx: idx + batch_size]].float().unsqueeze(1)  # [B, 1, H, W]
+                    # Expand to match error dimensions [batch_size, 4, 64, 64]
+                    mask = mask.expand(-1, 4, -1, -1)
                     # Compute pooling kernel and stride based on input/output size
-                    H, W = attended_masks[batch_idx].shape
+                    b, H, W = attended_masks[text_embed_idxs[idx: idx + batch_size]].shape
                     target_size = self.latent_size
                     kernel_size_h = H // target_size
                     kernel_size_w = W // target_size
                     
                     # Apply average pooling
                     latent_mask = F.avg_pool2d(mask, kernel_size=(kernel_size_h, kernel_size_w),
-                          stride=(kernel_size_h, kernel_size_w))
-                    
-                    # Expand to match error dimensions [batch_size, 4, 64, 64]
-                    latent_mask = latent_mask.expand(error.size(0), 4, -1, -1).to(error.device)
+                          stride=(kernel_size_h, kernel_size_w)).to(error.device)
                     
                     # Apply mask
                     error = error * latent_mask
