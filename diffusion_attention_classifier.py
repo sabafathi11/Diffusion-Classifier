@@ -292,11 +292,11 @@ class DiffusionEvaluator:
         plt.tight_layout()
         
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.savefig(osp.join(self.run_folder, save_path), dpi=300, bbox_inches='tight')
         
         plt.show()
 
-    def compute_attended_pixels(self, image, class_names, class_name):
+    def compute_attended_pixels(self, image, class_names, class_name, true_class):
         if isinstance(image, torch.Tensor):
             image_pil = torch_transforms.ToPILImage()(image * 0.5 + 0.5)
         else:
@@ -320,12 +320,12 @@ class DiffusionEvaluator:
                 attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.1)
                 
                 # Add visualization here
-                print(f"Visualizing attention mask for class: {class_name}")
+                print(f"Visualizing attention mask for class: {true_class} with prompt class: {class_name}")
                 self.visualize_mask_on_image(
                     image=image, 
                     mask=attended_pixels, 
                     class_name=class_name,
-                    save_path=f"attention_mask_{class_name}.png"  # Optional: save visualization
+                    save_path=f"{true_class}/attention_mask_{class_name}.png"  # Optional: save visualization
                 )
                 
         print()
@@ -356,12 +356,13 @@ class DiffusionEvaluator:
             curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
             curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
             for prompt_i in remaining_prmpt_idxs:
+                print('evaluating error for label',class_names[prompt_i])
                 for t_idx, t in enumerate(curr_t_to_eval, start=len(t_evaluated)):
                     ts.extend([t] * args.n_trials)
                     noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
                     text_embed_idxs.extend([prompt_i] * args.n_trials)
             t_evaluated.update(curr_t_to_eval)
-            attended_mask = self.compute_attended_pixels(image, class_names, class_name)
+            attended_mask = self.compute_attended_pixels(image, class_names, class_names[prompt_i], true_class=class_name)
             pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, attended_mask)
             # match up computed errors to the data
@@ -601,6 +602,8 @@ class DiffusionEvaluator:
             
             class_names = self.prompts_df.classname.tolist()
             class_name = class_names[label]
+
+            print('classname:', class_name)
 
             print()
 
