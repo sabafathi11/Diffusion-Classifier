@@ -238,16 +238,8 @@ class DiffusionEvaluator:
         
         return masked_hm
 
-    def visualize_mask_on_image(self, image, mask, class_name, save_path=None):
-        """
-        Visualize the mask overlaid on the original image
-        
-        Args:
-            image: Original image (PIL Image or torch.Tensor)
-            mask: Attention mask (torch.Tensor)
-            class_name: Name of the class being attended to
-            save_path: Optional path to save the visualization
-        """
+    def visualize_mask_on_image(self, image, heat_map, mask, save_path=None):
+
         # Convert image to numpy array
         if isinstance(image, torch.Tensor):
             # Denormalize if needed (assuming normalized to [-1, 1])
@@ -263,31 +255,23 @@ class DiffusionEvaluator:
             mask_np = cv2.resize(mask_np, (image_np.shape[1], image_np.shape[0]))
         
         # Create visualization
-        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+        fig, axes = plt.subplots(1, 3, figsize=(20, 5))
         
         # Original image
         axes[0].imshow(image_np)
         axes[0].set_title('Original Image')
         axes[0].axis('off')
-        
-        # Mask heatmap
-        mask_plot = axes[1].imshow(mask_np, cmap='jet', alpha=0.8)
-        axes[1].set_title(f'Attention Mask for "{class_name}"')
+
+        heat_map.plot_overlay(image_np, ax=axes[1])
+        axes[1].set_title('Heatmap Overlay')
         axes[1].axis('off')
-        plt.colorbar(mask_plot, ax=axes[1], fraction=0.046, pad=0.04)
         
         # Overlay visualization
         axes[2].imshow(image_np)
-        axes[2].imshow(mask_np, cmap='jet', alpha=0.5)
+        axes[2].imshow(mask_np, cmap='jet', alpha=0.3)
         axes[2].set_title('Mask Overlay')
         axes[2].axis('off')
         
-        # Binary mask visualization
-        binary_mask = (mask_np > 0).astype(float)
-        axes[3].imshow(image_np)
-        axes[3].imshow(binary_mask, cmap='Reds', alpha=0.3)
-        axes[3].set_title('Binary Mask Overlay')
-        axes[3].axis('off')
         
         plt.tight_layout()
         
@@ -320,14 +304,15 @@ class DiffusionEvaluator:
                 attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.1)
                 
                 # Add visualization here
-                print(f"Visualizing attention mask for class: {true_class} with prompt class: {class_name}")
-                self.visualize_mask_on_image(
-                    image=image, 
-                    mask=attended_pixels, 
-                    class_name=class_name,
-                    save_path=f"{true_class}/attention_mask_{class_name}.png"  # Optional: save visualization
-                )
-                
+        print(f"Visualizing attention mask for class {true_class} with label {class_name}")
+        print()
+        os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
+        self.visualize_mask_on_image(
+            image=image,
+            heat_map = heat_map, 
+            mask=attended_pixels,
+            save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
+        )
         print()
         return attended_pixels
     
@@ -353,6 +338,7 @@ class DiffusionEvaluator:
             ts = []
             noise_idxs = []
             text_embed_idxs = []
+            attended_masks = []
             curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
             curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
             for prompt_i in remaining_prmpt_idxs:
@@ -361,10 +347,11 @@ class DiffusionEvaluator:
                     ts.extend([t] * args.n_trials)
                     noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
                     text_embed_idxs.extend([prompt_i] * args.n_trials)
+                attended_mask = self.compute_attended_pixels(image, class_names, class_names[prompt_i], true_class=class_name)
             t_evaluated.update(curr_t_to_eval)
-            attended_mask = self.compute_attended_pixels(image, class_names, class_names[prompt_i], true_class=class_name)
+            attended_masks.append(attended_mask)
             pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                                    text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, attended_mask)
+                                    text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, attended_masks)
             # match up computed errors to the data
             for prompt_i in remaining_prmpt_idxs:
                 mask = torch.tensor(text_embed_idxs) == prompt_i
@@ -393,7 +380,7 @@ class DiffusionEvaluator:
 
     def eval_error(self, unet, scheduler, latent, all_noise, ts, noise_idxs,
                 text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2', 
-                attended_mask=None):
+                attended_masks=None):
         assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
         pred_errors = torch.zeros(len(ts), device='cpu')
         idx = 0
@@ -425,12 +412,12 @@ class DiffusionEvaluator:
                     raise NotImplementedError
                 
                 # Apply attended pixels mask if provided
-                if attended_mask is not None:
+                if attended_masks[text_embed_idxs[idx: idx + batch_size]] is not None:
                     # attended_mask is [H, W] with values in {0,1}
-                    mask = attended_mask.float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+                    mask = attended_masks[batch_idx].float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
                     
                     # Compute pooling kernel and stride based on input/output size
-                    H, W = attended_mask.shape
+                    H, W = attended_masks[batch_idx].shape
                     target_size = self.latent_size
                     kernel_size_h = H // target_size
                     kernel_size_w = W // target_size
@@ -609,8 +596,8 @@ class DiffusionEvaluator:
 
             # Then modify the eval_prob_adaptive call to pass the mask down
             _,pred_idx, pred_errors = self.eval_prob_adaptive(
-                self.unet, x0, text_embeddings_to_use, self.scheduler, 
-                self.args, self.latent_size, self.all_noise, image, class_names, class_name
+                self.unet, x0, text_embeddings_to_use, self.scheduler, self.args, image, class_names, class_name,
+                self.latent_size, self.all_noise
             )
             
             if self.use_learned_templates:
@@ -648,20 +635,20 @@ def main():
     parser = argparse.ArgumentParser()
 
     # dataset args
-    parser.add_argument('--dataset', type=str, default='pets',
+    parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
                                  'objectnet', 'aircraft'], help='Dataset to use')
-    parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
+    parser.add_argument('--split', type=str, default='test', choices=['train', 'test'], help='Name of split')
 
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Number of trials per timestep')
     parser.add_argument('--batch_size', '-b', type=int, default=32)
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
-    parser.add_argument('--prompt_path', type=str, default=None, help='Path to csv file with prompts to use')
+    parser.add_argument('--prompt_path', type=str, default='prompts/cifar10_prompts.csv', help='Path to csv file with prompts to use')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
-    parser.add_argument('--samples_per_class', type=int, default=None, help='Number of samples per class for balanced subset')
+    parser.add_argument('--samples_per_class', type=int, default=10, help='Number of samples per class for balanced subset')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
                         help='Model data type to use')
     parser.add_argument('--interpolation', type=str, default='bicubic', help='Resize interpolation type')
@@ -669,12 +656,12 @@ def main():
     parser.add_argument('--n_workers', type=int, default=1, help='Number of workers to split the dataset across')
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
-    parser.add_argument('--loss', type=str, default='l2', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
+    parser.add_argument('--loss', type=str, default='l1', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
     parser.add_argument('--template_path', type=str, default=None, help='Path to trained templates')
 
     # args for adaptively choosing which classes to continue trying
-    parser.add_argument('--to_keep', nargs='+', type=int, required=True)
-    parser.add_argument('--n_samples', nargs='+', type=int, required=True)
+    parser.add_argument('--to_keep', nargs='+', type=int, default=[5, 1], required=True)
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[50, 500], required=True)
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
