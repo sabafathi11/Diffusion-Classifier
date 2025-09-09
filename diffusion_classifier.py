@@ -13,6 +13,9 @@ import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 from collections import defaultdict
 from learnable_templates import TemplateLearner, TemplateConfig, TemplateTextEncoder
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -81,6 +84,11 @@ class DiffusionEvaluator:
         self.args = args
         self.device = device
         
+        # Initialize tracking variables for results
+        self.all_predictions = []
+        self.all_labels = []
+        self.classidx_to_name = {}
+        
         # Set up models and other components
         self._setup_models()
         self._setup_dataset()
@@ -89,6 +97,7 @@ class DiffusionEvaluator:
         self._setup_noise()
         self._setup_run_folder()
         self._setup_learned_templates()
+        self._setup_class_names()
   
         
     def _setup_models(self):
@@ -189,6 +198,18 @@ class DiffusionEvaluator:
         else:
             self.use_learned_templates = False
     
+    def _setup_class_names(self):
+        """Setup class name mapping"""
+        if hasattr(self.target_dataset, 'classes'):
+            # For datasets with class names
+            for idx, class_name in enumerate(self.target_dataset.classes):
+                self.classidx_to_name[idx] = class_name
+        elif self.args.prompt_path is not None and hasattr(self, 'prompts_df'):
+            # If using prompts, try to extract class names from prompts_df
+            if 'class_name' in self.prompts_df.columns:
+                for _, row in self.prompts_df.iterrows():
+                    self.classidx_to_name[row['classidx']] = row['class_name']
+    
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
         scheduler_config = get_scheduler_config(args)
         T = scheduler_config['num_train_timesteps']
@@ -275,6 +296,99 @@ class DiffusionEvaluator:
                 idx += len(batch_ts)
         return pred_errors
 
+    def plot_confusion_matrix(self, save_path=None):
+        """Generate and save confusion matrix plot."""
+        if len(self.all_predictions) == 0 or len(self.all_labels) == 0:
+            print("No predictions available for confusion matrix")
+            return
+        
+        # Get unique class labels and their names
+        unique_labels = sorted(list(set(self.all_labels + self.all_predictions)))
+        class_names = [self.classidx_to_name.get(label, str(label)) for label in unique_labels]
+        
+        # Compute confusion matrix
+        cm = confusion_matrix(self.all_labels, self.all_predictions, labels=unique_labels)
+        
+        # Create figure
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=class_names, yticklabels=class_names)
+        plt.title('Confusion Matrix')
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Confusion matrix saved to {save_path}")
+        else:
+            plt.savefig(osp.join(self.run_folder, 'confusion_matrix.png'), dpi=300, bbox_inches='tight')
+            print(f"Confusion matrix saved to {osp.join(self.run_folder, 'confusion_matrix.png')}")
+        plt.close()
+        
+        # Save classification report
+        report = classification_report(self.all_labels, self.all_predictions, 
+                                     labels=unique_labels, target_names=class_names)
+        report_path = osp.join(self.run_folder, 'classification_report.txt')
+        with open(report_path, 'w') as f:
+            f.write(report)
+        print(f"Classification report saved to {report_path}")
+
+    def save_results_summary(self):
+        """Save a comprehensive summary of results."""
+        if len(self.all_predictions) == 0 or len(self.all_labels) == 0:
+            print("No results to summarize")
+            return
+            
+        summary_path = osp.join(self.run_folder, 'results_summary.txt')
+        with open(summary_path, 'w') as f:
+            f.write("Diffusion Classification Results Summary\n")
+            f.write("=======================================\n\n")
+            
+            # Overall accuracy
+            correct = sum(1 for p, l in zip(self.all_predictions, self.all_labels) if p == l)
+            total = len(self.all_predictions)
+            accuracy = (correct / total * 100) if total > 0 else 0
+            
+            f.write(f"Overall Results:\n")
+            f.write(f"Total samples: {total}\n")
+            f.write(f"Correct predictions: {correct}\n")
+            f.write(f"Accuracy: {accuracy:.2f}%\n\n")
+            
+            # Diffusion model configuration
+            f.write(f"Model Configuration:\n")
+            f.write(f"Version: {self.args.version}\n")
+            f.write(f"Image size: {self.args.img_size}\n")
+            f.write(f"Batch size: {self.args.batch_size}\n")
+            f.write(f"Number of trials: {self.args.n_trials}\n")
+            f.write(f"Loss function: {self.args.loss}\n")
+            f.write(f"Data type: {self.args.dtype}\n")
+            f.write(f"Interpolation: {self.args.interpolation}\n")
+            if self.args.template_path:
+                f.write(f"Using learned templates: {self.args.template_path}\n")
+            f.write(f"Adaptive sampling - n_samples: {self.args.n_samples}\n")
+            f.write(f"Adaptive sampling - to_keep: {self.args.to_keep}\n\n")
+            
+            # Per-class accuracy if we have class names
+            if hasattr(self, 'classidx_to_name') and len(self.classidx_to_name) > 0:
+                f.write("Per-class Results:\n")
+                class_stats = {}
+                for true_label, pred_label in zip(self.all_labels, self.all_predictions):
+                    if true_label not in class_stats:
+                        class_stats[true_label] = {'total': 0, 'correct': 0}
+                    class_stats[true_label]['total'] += 1
+                    if true_label == pred_label:
+                        class_stats[true_label]['correct'] += 1
+                
+                for class_idx, stats in sorted(class_stats.items()):
+                    class_name = self.classidx_to_name.get(class_idx, str(class_idx))
+                    class_acc = (stats['correct'] / stats['total'] * 100) if stats['total'] > 0 else 0
+                    f.write(f"{class_name}: {stats['correct']}/{stats['total']} ({class_acc:.1f}%)\n")
+        
+        print(f"Results summary saved to {summary_path}")
+
     def run_evaluation(self):
         # subset of dataset to evaluate
         if self.args.subset_path is not None:
@@ -301,6 +415,9 @@ class DiffusionEvaluator:
                     data = torch.load(fname)
                     correct += int(data['pred'] == data['label'])
                     total += 1
+                    # Track predictions and labels for summary
+                    self.all_predictions.append(data['pred'])
+                    self.all_labels.append(data['label'])
                 continue
             image, label = self.target_dataset[i]
             with torch.no_grad():
@@ -332,6 +449,14 @@ class DiffusionEvaluator:
             if pred == label:
                 correct += 1
             total += 1
+            
+            # Track predictions and labels for summary
+            self.all_predictions.append(pred)
+            self.all_labels.append(label)
+        
+        # Generate confusion matrix and summary after evaluation
+        self.plot_confusion_matrix()
+        self.save_results_summary()
 
 
 def main():

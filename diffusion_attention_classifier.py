@@ -298,21 +298,21 @@ class DiffusionEvaluator:
                 heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
                 hm = heat_map.heatmap  # already a torch.Tensor on GPU
 
-                attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.1)
+                # attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.15)
                 
-                # Add visualization here
-        print(f"Visualizing attention mask for class {true_class} with label {class_name}")
-        print()
-        os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
-        self.visualize_mask_on_image(
-            image=image,
-            heat_map=heat_map,
-            out=out,
-            mask=attended_pixels,
-            save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
-        )
-        print()
-        return attended_pixels
+        # # Add visualization here
+        # print(f"Visualizing attention mask for class {true_class} with label {class_name}")
+        # print()
+        # os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
+        # self.visualize_mask_on_image(
+        #     image=image,
+        #     heat_map=heat_map,
+        #     out=out,
+        #     mask=attended_pixels,
+        #     save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
+        # )
+        # print()
+        return hm
     
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, class_names, class_name,
                             latent_size=64, all_noise=None):

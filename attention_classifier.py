@@ -13,6 +13,10 @@ import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 from collections import defaultdict
 
+# Import plotting libraries
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
 
 # Import DAAM components
 from daam import trace, set_seed
@@ -79,6 +83,10 @@ class DAAMDiffusionClassifier:
         self.args = args
         self.device = device
         
+        # Initialize tracking lists for plotting
+        self.all_predictions = []
+        self.all_labels = []
+        
         # Set up models and other components
         self._setup_models()
         self._setup_dataset()
@@ -110,6 +118,9 @@ class DAAMDiffusionClassifier:
         
         # Use classname column for DAAM processing
         self.class_names = self.prompts_df.classname.tolist()
+        
+        # Create mapping from class index to class name for plotting
+        self.classidx_to_name = dict(zip(self.prompts_df.classidx, self.prompts_df.classname))
         
     def _setup_noise(self):
         # load noise
@@ -219,6 +230,96 @@ class DAAMDiffusionClassifier:
         
         return daam_scores, pred_idx
 
+    def plot_confusion_matrix(self, save_path=None):
+        """Generate and save confusion matrix plot."""
+        if len(self.all_predictions) == 0 or len(self.all_labels) == 0:
+            print("No predictions available for confusion matrix")
+            return
+        
+        # Get unique class labels and their names
+        unique_labels = sorted(list(set(self.all_labels + self.all_predictions)))
+        class_names = [self.classidx_to_name.get(label, str(label)) for label in unique_labels]
+        
+        # Compute confusion matrix
+        cm = confusion_matrix(self.all_labels, self.all_predictions, labels=unique_labels)
+        
+        # Create figure
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=class_names, yticklabels=class_names)
+        plt.title('Confusion Matrix')
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Confusion matrix saved to {save_path}")
+        else:
+            plt.savefig(osp.join(self.run_folder, 'confusion_matrix.png'), dpi=300, bbox_inches='tight')
+            print(f"Confusion matrix saved to {osp.join(self.run_folder, 'confusion_matrix.png')}")
+        plt.close()
+        
+        # Save classification report
+        report = classification_report(self.all_labels, self.all_predictions, 
+                                     labels=unique_labels, target_names=class_names)
+        report_path = osp.join(self.run_folder, 'classification_report.txt')
+        with open(report_path, 'w') as f:
+            f.write(report)
+        print(f"Classification report saved to {report_path}")
+
+    def save_results_summary(self):
+        """Save a comprehensive summary of results."""
+        if len(self.all_predictions) == 0 or len(self.all_labels) == 0:
+            print("No results to summarize")
+            return
+            
+        summary_path = osp.join(self.run_folder, 'results_summary.txt')
+        with open(summary_path, 'w') as f:
+            f.write("Diffusion Classification Results Summary\n")
+            f.write("=======================================\n\n")
+            
+            # Overall accuracy
+            correct = sum(1 for p, l in zip(self.all_predictions, self.all_labels) if p == l)
+            total = len(self.all_predictions)
+            accuracy = (correct / total * 100) if total > 0 else 0
+            
+            f.write(f"Overall Results:\n")
+            f.write(f"Total samples: {total}\n")
+            f.write(f"Correct predictions: {correct}\n")
+            f.write(f"Accuracy: {accuracy:.2f}%\n\n")
+            
+            # Diffusion model configuration
+            f.write(f"Model Configuration:\n")
+            f.write(f"Version: {self.args.version}\n")
+            f.write(f"Image size: {self.args.img_size}\n")
+            f.write(f"Batch size: {self.args.batch_size}\n")
+            f.write(f"Number of trials: {self.args.n_trials}\n")
+            f.write(f"Data type: {self.args.dtype}\n")
+            f.write(f"Interpolation: {self.args.interpolation}\n")
+            f.write(f"DAAM steps: {self.args.daam_steps}\n")
+            f.write(f"DAAM seed: {self.args.daam_seed}\n\n")
+            
+            # Per-class accuracy if we have class names
+            if hasattr(self, 'classidx_to_name') and len(self.classidx_to_name) > 0:
+                f.write("Per-class Results:\n")
+                class_stats = {}
+                for true_label, pred_label in zip(self.all_labels, self.all_predictions):
+                    if true_label not in class_stats:
+                        class_stats[true_label] = {'total': 0, 'correct': 0}
+                    class_stats[true_label]['total'] += 1
+                    if true_label == pred_label:
+                        class_stats[true_label]['correct'] += 1
+                
+                for class_idx, stats in sorted(class_stats.items()):
+                    class_name = self.classidx_to_name.get(class_idx, str(class_idx))
+                    class_acc = (stats['correct'] / stats['total'] * 100) if stats['total'] > 0 else 0
+                    f.write(f"{class_name}: {stats['correct']}/{stats['total']} ({class_acc:.1f}%)\n")
+        
+        print(f"Results summary saved to {summary_path}")
+
     def run_evaluation(self):
         # subset of dataset to evaluate
         if self.args.subset_path is not None:
@@ -246,6 +347,9 @@ class DAAMDiffusionClassifier:
                     data = torch.load(fname)
                     correct += int(data['pred'] == data['label'])
                     total += 1
+                    # Add to tracking lists for plotting
+                    self.all_predictions.append(data['pred'])
+                    self.all_labels.append(data['label'])
                 continue
                 
             image, label = self.target_dataset[i]
@@ -259,11 +363,20 @@ class DAAMDiffusionClassifier:
             pred = self.prompts_df.classidx[pred_idx]
                 
             torch.save(dict(daam_scores=daam_scores, pred=pred, label=label), fname)
+            
+            # Add to tracking lists for plotting
+            self.all_predictions.append(pred)
+            self.all_labels.append(label)
+            
             if pred == label:
                 correct += 1
             total += 1
 
         print(f'Final DAAM Classification Accuracy: {100 * correct / total:.2f}%')
+        
+        # Generate plots and summary after evaluation
+        self.plot_confusion_matrix()
+        self.save_results_summary()
 
 
 def main():

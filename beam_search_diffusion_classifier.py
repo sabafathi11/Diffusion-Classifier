@@ -360,21 +360,9 @@ class DiffusionEvaluator:
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
-    def get_scaled_closeness(scores, min_output=50, max_output=500, mean=0.5, std_dev=0.5):
-
-        # Calculate variance
-        variance = torch.var(scores)
-        
-        # Calculate closeness
-        closeness = 1 / (1 + variance)
-        
-        # Calculate Gaussian probability density
-        gaussian_value = torch.exp(-0.5 * ((closeness - mean) / std_dev) ** 2)
-        
-        # Scale to desired output range
-        scaled_closeness = min_output + (max_output - min_output) * gaussian_value
-        
-        return scaled_closeness
+    def get_scaled_closeness(self, values, base=15, eps=1e-2):
+        std = np.std(values)
+        return int(base / (std + eps))
 
     def eval_prob_beam_search(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
         """Evaluate probabilities using beam search with hierarchical clustering."""
@@ -395,10 +383,11 @@ class DiffusionEvaluator:
         max_depth = min(self.args.cluster_depth, self.hierarchical_cluster.tree['depth'])
         
         # Beam search through hierarchical levels
+        #closeness_based_n = 100
         for depth_idx, depth in enumerate(range(1, max_depth + 1)):
             n_samples_at_depth = args.n_samples[depth_idx]
+            #n_samples_at_depth = closeness_based_n
             print(f"Beam search at depth {depth} with beam width {len(beam)}, using {n_samples_at_depth} samples")
-            
             new_beam = []
             
             for beam_candidates, beam_score in beam:
@@ -425,10 +414,6 @@ class DiffusionEvaluator:
                     # No meaningful splitting, keep current candidates
                     new_beam.append((beam_candidates, beam_score))
                     continue
-                #print(beam_score)
-                scaled_closeness = int(self.get_scaled_closeness(beam_score))
-
-                #n_samples_at_depth = scaled_closeness
 
                 # Evaluate representative classes from each cluster
                 cluster_representatives = [cluster['representative_idx'] for cluster in relevant_clusters]
@@ -475,13 +460,15 @@ class DiffusionEvaluator:
             
             # Keep top-k beam candidates
             beam = sorted(new_beam, key=lambda x: x[1], reverse=True)[:args.beam_width]
-            
+            #scores = []
             print(f"Beam search results at depth {depth}:")
             for i, (candidates, score) in enumerate(beam):
                 candidate_names = [self.classidx_to_name[self.unique_classidx[idx]] for idx in candidates]
                 print(f"  Beam {i+1}: {len(candidates)} classes, score: {score:.4f}")
+                #scores.append(score)
                 print(f"    Classes: {candidate_names}")
-            print()
+            #closeness_based_n = min(self.get_scaled_closeness(scores) // len(scores), 150)
+
         
         # Final evaluation on all remaining beam candidates
         final_candidates = []
@@ -494,6 +481,7 @@ class DiffusionEvaluator:
         if len(final_candidates) > 1:
             # Use the last (highest) n_samples value for final evaluation
             final_n_samples = args.n_samples[-1]
+            #final_n_samples = closeness_based_n
             print(f"Final beam search evaluation on {len(final_candidates)} candidates using {final_n_samples} samples")
             
             start = T // final_n_samples // 2
@@ -846,8 +834,8 @@ def main():
     # beam search clustering args
     parser.add_argument('--use_clustering', action='store_true', help='Enable beam search with hierarchical clustering')
     parser.add_argument('--cluster_depth', type=int, default=4, help='Maximum depth for hierarchical clustering')
-    parser.add_argument('--beam_width', type=int, default=4, help='Beam width for beam search (number of branches to keep)')
-    parser.add_argument('--n_samples', nargs='+', type=int, default=[10, 10, 10, 10, 500], help='Number of samples per depth (one integer per depth level)')
+    parser.add_argument('--beam_width', type=int, default=3, help='Beam width for beam search (number of branches to keep)')
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[100, 200, 200, 200], help='Number of samples per depth (one integer per depth level)')
 
     args = parser.parse_args()
 
