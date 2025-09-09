@@ -33,60 +33,62 @@ def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     ])
     return transform
 
-
 def run_experiment(pipe, image_pil, prompt, classes, hyperparams, output_dir, img_idx, label):
-    """Run experiment with given hyperparameters"""
     num_steps, strength, threshold_percentile = hyperparams
     
-    # Create specific directory for this hyperparameter combination
     param_dir = f"steps_{num_steps}_strength_{strength:.3f}_thresh_{threshold_percentile}"
     full_output_dir = osp.join(output_dir, label, param_dir)
     os.makedirs(full_output_dir, exist_ok=True)
     
-    gen = set_seed(0)  # Fixed seed for reproducibility
+    gen = set_seed(0)
     
-    for class_name in classes:
-        with torch.no_grad():
-            with trace(pipe) as tc:
-                out = pipe(
-                    prompt=prompt,
-                    image=image_pil,
-                    strength=strength,
-                    num_inference_steps=num_steps,
-                    generator=gen
-                )
+    # Store heatmaps for all classes
+    heatmaps = []
 
+    with torch.no_grad():
+        with trace(pipe) as tc:
+            out = pipe(
+                prompt=prompt,
+                image=image_pil,
+                strength=strength,
+                num_inference_steps=num_steps,
+                generator=gen
+            )
+            
+            for class_name in classes:
                 heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
                 hm = np.array(heat_map.heatmap.cpu())
                 threshold = np.percentile(hm, threshold_percentile)
-                mask = np.zeros_like(hm)
-                mask[hm > threshold] = hm[hm > threshold]
+                hm[hm < threshold] = 0  # filter weak activations
+                heatmaps.append(hm)
+    
+    heatmaps = np.stack(heatmaps, axis=0)  # shape: (num_classes, H, W)
+    class_map = np.argmax(heatmaps, axis=0)  # shape: (H, W)
+    
+    # Color map for visualization
+    colors = plt.cm.get_cmap('tab10', len(classes))
+    segmentation = colors(class_map / len(classes))  # RGBA
+    
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+    
+    axes[0].imshow(image_pil)
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
 
-                fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-                
-                # Original image
-                axes[0].imshow(image_pil)
-                axes[0].set_title('Original Image')
-                axes[0].axis('off')
+    axes[1].imshow(class_map, cmap='tab10')
+    axes[1].set_title('Class Map')
+    axes[1].axis('off')
+    
+    axes[2].imshow(image_pil)
+    axes[2].imshow(segmentation, alpha=0.5)
+    axes[2].set_title('Segmentation Overlay')
+    axes[2].axis('off')
 
-                # Heatmap overlay
-                heat_map.plot_overlay(out.images[0], ax=axes[1])
-                axes[1].set_title(f'Heatmap Overlay - {class_name}')
-                axes[1].axis('off')
-                
-                # Mask overlay
-                axes[2].imshow(image_pil)
-                axes[2].imshow(mask, alpha=0.5, cmap='hot')
-                axes[2].set_title(f'Mask Overlay - Thresh: {threshold_percentile}%')
-                axes[2].axis('off')
-
-                # Add hyperparameters as title
-                fig.suptitle(f'Steps: {num_steps}, Strength: {strength}, Threshold: {threshold_percentile}%, Image: {img_idx}')
-                
-                # Save with detailed filename
-                filename = f'heat_map_{class_name}_img{img_idx}_steps{num_steps}_str{strength:.3f}_thr{threshold_percentile}.png'
-                plt.savefig(osp.join(full_output_dir, filename), bbox_inches='tight', dpi=150)
-                plt.close()
+    fig.suptitle(f'Steps: {num_steps}, Strength: {strength}, Threshold: {threshold_percentile}%, Image: {img_idx}')
+    
+    filename = f'segmentation_img{img_idx}_steps{num_steps}_str{strength:.3f}_thr{threshold_percentile}.png'
+    plt.savefig(osp.join(full_output_dir, filename), bbox_inches='tight', dpi=150)
+    plt.close()
 
 def main():
     # Setup
@@ -105,16 +107,17 @@ def main():
         use_safetensors=True,
         variant='fp16',
     ).to(device)
-    
+
     class_names = dataset.classes
     prompt = ' '.join(class_names)
-    
+
     # Hyperparameter configurations
     HYPERPARAMS = {
-        'num_inference_steps': [50, 100],
-        'strength': [0.01, 0.03, 0.1],
-        'threshold_percentile': [70, 90, 95]
+        'num_inference_steps': [20, 50, 100],
+        'strength': [0.01, 0.03, 0.05, 0.1],
+        'threshold_percentile': [70, 80, 90, 95]
     }
+    
     # Create all combinations of hyperparameters
     param_combinations = list(itertools.product(
         HYPERPARAMS['num_inference_steps'],

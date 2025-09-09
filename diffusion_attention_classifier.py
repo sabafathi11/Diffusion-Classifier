@@ -290,28 +290,34 @@ class DiffusionEvaluator:
                 out = self.daam_pipe(
                     prompt=prompt,
                     image=image_pil,
-                    strength=0.03,
-                    num_inference_steps=100,
+                    strength=0.2,
+                    num_inference_steps=150,
                     generator=gen
                 )
 
                 heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
                 hm = heat_map.heatmap  # already a torch.Tensor on GPU
+                threshold = torch.tensor(
+                    np.percentile(hm.cpu().numpy(), 75)  # move to CPU first
+                ).to(hm.device)
+                hm = torch.where(hm >= threshold, hm, torch.zeros_like(hm))
+                for i in hm:
+                    print(i)
 
                 # attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.15)
                 
-        # # Add visualization here
-        # print(f"Visualizing attention mask for class {true_class} with label {class_name}")
-        # print()
-        # os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
-        # self.visualize_mask_on_image(
-        #     image=image,
-        #     heat_map=heat_map,
-        #     out=out,
-        #     mask=attended_pixels,
-        #     save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
-        # )
-        # print()
+        # Add visualization here
+        print(f"Visualizing attention mask for class {true_class} with label {class_name}")
+        print()
+        os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
+        self.visualize_mask_on_image(
+            image=image,
+            heat_map=heat_map,
+            out=out,
+            mask=hm,
+            save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
+        )
+        print()
         return hm
     
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, class_names, class_name,
@@ -428,7 +434,7 @@ class DiffusionEvaluator:
                     error = error * latent_mask
 
                 # Compute mean error per sample
-                error = error.mean(dim=(1, 2, 3))
+                error = error.mean(dim=(1, 2, 3)) / mask.sum(dim=(1, 2, 3))
                 pred_errors[idx: idx + len(batch_ts)] = error.detach().cpu()
                 idx += len(batch_ts)
                 
