@@ -4,193 +4,60 @@ import torch
 from daam import trace, set_seed
 from matplotlib import pyplot as plt
 import numpy as np
-from diffusion.datasets import get_target_dataset
-import torchvision.transforms as torch_transforms
-from torchvision.transforms.functional import InterpolationMode
-from diffusers import DiffusionPipeline
-from torchvision.transforms.functional import to_pil_image
-import os.path as osp
-import os
-import itertools
+
+# Load your existing image
+image_path = "dog1.jpg"
+image_pil = Image.open(image_path).convert("RGB").resize((1024, 1024))
+
+model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
+device = 'cuda'
+
+pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+    model_id,
+    torch_dtype=torch.float16,
+    use_safetensors=True,
+    variant='fp16',
+).to(device)
 
 
-INTERPOLATIONS = {
-    'bilinear': InterpolationMode.BILINEAR,
-    'bicubic': InterpolationMode.BICUBIC,
-    'lanczos': InterpolationMode.LANCZOS,
-}
+prompt = "bird horse cat deer frog dog truck airplane automobile ship"
+gen = set_seed(0)
 
-def _convert_image_to_rgb(image):
-    return image.convert("RGB")
+classes = prompt.split()
 
-def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
-    transform = torch_transforms.Compose([
-        torch_transforms.Resize(size, interpolation=interpolation),
-        torch_transforms.CenterCrop(size),
-        _convert_image_to_rgb,
-        torch_transforms.ToTensor(),
-        torch_transforms.Normalize([0.5], [0.5])
-    ])
-    return transform
+for label in classes :
+    print(label,end='\n\n')
+    with torch.no_grad():
+        with trace(pipe) as tc:
+            out = pipe(
+                prompt=prompt,
+                image=image_pil,
+                strength=0.03,      # tiny value to avoid changes but keep pipeline working
+                num_inference_steps=150,
+                generator=gen
+            )
 
+            heat_map = tc.compute_global_heat_map()
+            heat_map = heat_map.compute_word_heat_map(label)
 
-def run_experiment(pipe, image_pil, prompt, classes, hyperparams, output_dir, img_idx, label):
-    """Run experiment with given hyperparameters"""
-    num_steps, strength, threshold_percentile = hyperparams
-    
-    # Create specific directory for this hyperparameter combination
-    param_dir = f"steps_{num_steps}_strength_{strength:.3f}_thresh_{threshold_percentile}"
-    full_output_dir = osp.join(output_dir, label, param_dir)
-    os.makedirs(full_output_dir, exist_ok=True)
-    
-    gen = set_seed(0)  # Fixed seed for reproducibility
-    
-    for class_name in classes:
-        with torch.no_grad():
-            with trace(pipe) as tc:
-                out = pipe(
-                    prompt=prompt,
-                    image=image_pil,
-                    strength=strength,
-                    num_inference_steps=num_steps,
-                    generator=gen
-                )
+            # heat_map.plot_overlay(out.images[0])
+            # plt.savefig(f'heat_map_{label}1.png')
 
-                heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
-                hm = np.array(heat_map.heatmap.cpu())
-                threshold = np.percentile(hm, threshold_percentile)
-                mask = np.zeros_like(hm)
-                mask[hm > threshold] = hm[hm > threshold]
-
-                fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-                
-                # Original image
-                axes[0].imshow(image_pil)
-                axes[0].set_title('Original Image')
-                axes[0].axis('off')
-
-                # Heatmap overlay
-                heat_map.plot_overlay(out.images[0], ax=axes[1])
-                axes[1].set_title(f'Heatmap Overlay - {class_name}')
-                axes[1].axis('off')
-                
-                # Mask overlay
-                axes[2].imshow(image_pil)
-                axes[2].imshow(mask, alpha=0.5, cmap='hot')
-                axes[2].set_title(f'Mask Overlay - Thresh: {threshold_percentile}%')
-                axes[2].axis('off')
-
-                # Add hyperparameters as title
-                fig.suptitle(f'Steps: {num_steps}, Strength: {strength}, Threshold: {threshold_percentile}%, Image: {img_idx}')
-                
-                # Save with detailed filename
-                filename = f'heat_map_{class_name}_img{img_idx}_steps{num_steps}_str{strength:.3f}_thr{threshold_percentile}.png'
-                plt.savefig(osp.join(full_output_dir, filename), bbox_inches='tight', dpi=150)
-                plt.close()
-
-def main():
-    # Setup
-    interpolation = INTERPOLATIONS['bicubic']
-    transform = get_transform(interpolation, 512)
-    dataset = get_target_dataset('cifar10', 'test', transform=transform)
-    
-    rand_idx = np.random.choice(np.arange(0, len(dataset)), size=5, replace=False)
-    model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
-    device = 'cuda'
-    
-    # Load model once
-    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        use_safetensors=True,
-        variant='fp16',
-    ).to(device)
-    
-    class_names = dataset.classes
-    prompt = ' '.join(class_names)
-    
-    # Hyperparameter configurations
-    HYPERPARAMS = {
-        'num_inference_steps': [50, 100],
-        'strength': [0.01, 0.03, 0.1],
-        'threshold_percentile': [70, 90, 95]
-    }
-    # Create all combinations of hyperparameters
-    param_combinations = list(itertools.product(
-        HYPERPARAMS['num_inference_steps'],
-        HYPERPARAMS['strength'], 
-        HYPERPARAMS['threshold_percentile']
-    ))
-    
-    print(f"Testing {len(param_combinations)} hyperparameter combinations on {len(rand_idx)} images")
-    
-    # Main experiment loop
-    for i in rand_idx:
-        img, label = dataset[i]
-        label = class_names[label]
-        print(f"\nProcessing Image Index: {i}, Label: {label}, Image shape: {img.shape}")
-        image_pil = to_pil_image(img)
-        
-        for param_idx, params in enumerate(param_combinations):
-            print(f"  Running combination {param_idx + 1}/{len(param_combinations)}: "
-                  f"steps={params[0]}, strength={params[1]}, threshold={params[2]}%")
             
-            run_experiment(
-                pipe, image_pil, prompt, class_names, params, 
-                'daam_hyperparameter', i, label
-            )
-    
-    print("\nHyperparameter sweep completed!")
-    print(f"Results saved in 'daam_hyperparameter' directory")
+            heat_arr = np.array(heat_map.heatmap.cpu()) # shape: (H, W), values in [0, 1]
 
-if __name__ == "__main__":
-    main()
+            print(heat_arr.shape)
+            print(heat_arr.)
+
+            # total_attention = heat_arr.sum()
+            # print(f"Total attention value for: {total_attention}")
 
 
-# Alternative: Run specific hyperparameter combinations
-def run_custom_params():
-    """
-    Alternative function to test specific hyperparameter combinations
-    Modify the custom_params list below to test specific combinations
-    """
-    # Define custom parameter combinations
-    custom_params = [
-        (20, 0.01, 80),   # (num_steps, strength, threshold_percentile)
-        (50, 0.03, 80),
-        (100, 0.05, 90),
-        # Add more combinations as needed
-    ]
-    
-    # Setup (same as main)
-    interpolation = INTERPOLATIONS['bicubic']
-    transform = get_transform(interpolation, 512)
-    dataset = get_target_dataset('cifar10', 'test', transform=transform)
-    
-    rand_idx = np.random.choice(np.arange(0, len(dataset)), size=2, replace=False)  # Fewer images for testing
-    model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
-    device = 'cuda'
-    
-    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        use_safetensors=True,
-        variant='fp16',
-    ).to(device)
-    
-    prompt = "bird horse cat deer frog dog truck airplane automobile ship"
-    classes = prompt.split()
-    
-    for i in rand_idx:
-        img, label = dataset[i]
-        print(f"\nProcessing Image Index: {i}, Label: {label}")
-        image_pil = to_pil_image(img)
-        
-        for params in custom_params:
-            print(f"  Testing: steps={params[0]}, strength={params[1]}, threshold={params[2]}%")
-            run_experiment(
-                pipe, image_pil, prompt, classes, params,
-                'daam_custom_params', i, label
-            )
+            # threshold = 0.15
+            # attended_pixels = (heat_arr >= threshold).sum()
+            # total_pixels = heat_arr.size
+            # attended_percentage = attended_pixels / total_pixels * 100
+            # print(f"Attended pixels for {label}: {attended_pixels} / {total_pixels} ({attended_percentage:.2f}%)")
 
-# Uncomment the line below to run custom parameters instead of full sweep
-# run_custom_params()
+
+            print('\n')

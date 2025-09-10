@@ -15,12 +15,12 @@ from collections import defaultdict
 from learnable_templates import TemplateLearner, TemplateConfig, TemplateTextEncoder
 from diffusers import StableDiffusionXLImg2ImgPipeline
 from daam import trace, set_seed
+import seaborn as sns
 
 # Additional imports for analysis functions
 import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.patches as mpatches
 from sklearn.metrics import confusion_matrix, classification_report
-import cv2
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -252,8 +252,6 @@ class DiffusionEvaluator:
         
         # Convert mask to numpy and resize to match image dimensions
         mask_np = mask.cpu().numpy()
-        if mask_np.shape != image_np.shape[:2]:
-            mask_np = cv2.resize(mask_np, (image_np.shape[1], image_np.shape[0]))
         
         # Create visualization
         fig, axes = plt.subplots(1, 3, figsize=(20, 5))
@@ -282,7 +280,8 @@ class DiffusionEvaluator:
             image_pil = torch_transforms.ToPILImage()(image * 0.5 + 0.5)
         else:
             image_pil = image
-        prompt = ' '.join(class_names)
+        #prompt = ' '.join(class_names)
+        prompt = f'a photo of a {class_name}'
 
         gen = set_seed(0)
         with torch.no_grad():
@@ -290,34 +289,33 @@ class DiffusionEvaluator:
                 out = self.daam_pipe(
                     prompt=prompt,
                     image=image_pil,
-                    strength=0.2,
-                    num_inference_steps=150,
+                    strength=0.01,
+                    num_inference_steps=100,
                     generator=gen
                 )
 
                 heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
                 hm = heat_map.heatmap  # already a torch.Tensor on GPU
-                threshold = torch.tensor(
-                    np.percentile(hm.cpu().numpy(), 75)  # move to CPU first
-                ).to(hm.device)
-                hm = torch.where(hm >= threshold, hm, torch.zeros_like(hm))
-                for i in hm:
-                    print(i)
+                # threshold = torch.tensor(
+                #     np.percentile(hm.cpu().numpy(), 75)  # move to CPU first
+                # ).to(hm.device)
+                # hm = torch.where(hm >= threshold, hm, torch.zeros_like(hm))
 
                 # attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.15)
                 
         # Add visualization here
-        print(f"Visualizing attention mask for class {true_class} with label {class_name}")
-        print()
-        os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
-        self.visualize_mask_on_image(
-            image=image,
-            heat_map=heat_map,
-            out=out,
-            mask=hm,
-            save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
-        )
-        print()
+        # print(f"Visualizing attention mask for class {true_class} with label {class_name}")
+        # print()
+        # os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
+        # self.visualize_mask_on_image(
+        #     image=image,
+        #     heat_map=heat_map,
+        #     out=out,
+        #     mask=hm,
+        #     save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
+        # )
+        # print()
+
         return hm
     
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, class_names, class_name,
@@ -337,14 +335,34 @@ class DiffusionEvaluator:
         remaining_prmpt_idxs = list(range(len(text_embeds)))
         start = T // max_n_samples // 2
         t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
+        attended_masks = [self.compute_attended_pixels(image, class_names, class_names[i], true_class=class_name)
+                              for i in range(len(class_names))]
+        attended_masks = torch.stack(attended_masks, dim=0)
+        heatmap1 = np.stack(attended_masks.cpu().numpy(), axis=0)
+        class_map = np.argmax(heatmap1, axis=0)
+        colors = plt.cm.get_cmap('tab10', 10)
+        segmentation = colors(class_map)
+        label_colors = [colors(i) for i in range(10)]
+        patches = [
+            mpatches.Patch(color=label_colors[i], label=f'Class {class_names[i]}')
+            for i in range(10)
+        ]
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        axes[0].imshow(image.permute(1, 2, 0))
+        axes[0].set_title('Original Image')
+        axes[0].axis('off')
+        axes[1].imshow(segmentation)
+        axes[1].set_title('Segmentation Overlay')
+        axes[1].axis('off')
+        axes[1].legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left')
 
+        plt.tight_layout()
+        plt.savefig(osp.join(self.run_folder, f"{class_name}_segmentation.png"), dpi=300, bbox_inches='tight')
+        plt.close()
         for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
             ts = []
             noise_idxs = []
             text_embed_idxs = []
-            attended_masks = [self.compute_attended_pixels(image, class_names, class_names[i], true_class=class_name)
-                              for i in range(len(class_names))]
-            attended_masks = torch.stack(attended_masks, dim=0)  # [num_prompts, H, W]
             curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
             curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
             for prompt_i in remaining_prmpt_idxs:
@@ -416,7 +434,6 @@ class DiffusionEvaluator:
                 
                 # Apply attended pixels mask if provided
                 if attended_masks is not None:
-                    # attended_mask is [H, W] with values in {0,1}
                     mask = attended_masks[text_embed_idxs[idx: idx + batch_size]].float().unsqueeze(1)  # [B, 1, H, W]
                     # Expand to match error dimensions [batch_size, 4, 64, 64]
                     mask = mask.expand(-1, 4, -1, -1)
