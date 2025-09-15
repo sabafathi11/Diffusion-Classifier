@@ -8,199 +8,192 @@ from torchvision.transforms.functional import InterpolationMode
 from torchvision import datasets
 from diffusion.utils import DATASET_ROOT
 from torch.utils.data import DataLoader
+from diffusion.datasets import get_target_dataset
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-class WorkingPromptLearner(torch.nn.Module):
+seed = 42
+
+torch.manual_seed(seed)             # sets seed for CPU
+torch.cuda.manual_seed(seed)        # sets seed for current GPU
+torch.cuda.manual_seed_all(seed)    # sets seed for all GPUs (if you use multi-GPU)
+np.random.seed(seed) 
+
+
+class TemplatePromptLearner(torch.nn.Module):
     """
-    FIXED: Learn to map class embeddings to text embedding space properly
+    Learn a GLOBAL template embedding that gets concatenated with class name embeddings.
+    The template is optimized during training and can be reused across different classes.
     """
-    def __init__(self, tokenizer, text_encoder, classnames, device=None):
+    def __init__(self, tokenizer, text_encoder, n_template_tokens=57, class_max_length=20, template_init=None, device=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
-        self.classnames = classnames
-        self.num_classes = len(classnames)
+        self.n_template_tokens = n_template_tokens
+        self.class_max_length = class_max_length
         self.device = device if device is not None else next(text_encoder.parameters()).device
         self.hidden_size = text_encoder.config.hidden_size
-
-        # FIXED: Create learnable vectors that will replace the class name tokens
-        # Initialize them close to existing class name embeddings
-        self.learned_embeddings = torch.nn.Parameter(
-            torch.randn(self.num_classes, self.hidden_size, device=self.device) * 0.02
-        )
         
-        # Get the base template embeddings and find where to insert class-specific info
-        template = "a photo of a {}"
-        self.template_texts = [template.format("object") for _ in classnames]  # placeholder
-        self.class_texts = [template.format(name) for name in classnames]
-        
-        # Encode the templates to get positions
-        with torch.no_grad():
-            # Get template with placeholder
-            enc_template = tokenizer(
-                self.template_texts,
-                padding="max_length",
-                truncation=True,
-                max_length=77,
-                return_tensors="pt"
-            )
-            
-            # Get actual class texts to see the difference
-            enc_classes = tokenizer(
-                self.class_texts,
-                padding="max_length",
-                truncation=True,
-                max_length=77,
-                return_tensors="pt"
-            )
-            
-            self.template_ids = enc_template["input_ids"].to(device)
-            self.class_ids = enc_classes["input_ids"].to(device)
-            self.attention_mask = enc_classes["attention_mask"].to(device)
-            
-            # Find positions where class names appear (differ from template)
-            self.class_positions = []
-            for i in range(self.num_classes):
-                diff_mask = (self.template_ids[i] != self.class_ids[i])
-                positions = torch.where(diff_mask)[0]
-                # Usually the class name is one token, take the first differing position
-                self.class_positions.append(positions[0].item() if len(positions) > 0 else 4)
-                
-            print(f"Class positions: {self.class_positions}")
-            
-            # Get base embeddings
-            self.base_embeddings = text_encoder.get_input_embeddings()(self.class_ids)
-            
-            # Initialize learned embeddings close to actual class embeddings
-            for i in range(self.num_classes):
-                pos = self.class_positions[i]
-                self.learned_embeddings.data[i] = self.base_embeddings[i, pos].clone() + torch.randn_like(self.base_embeddings[i, pos]) * 0.01
+        # Ensure total length doesn't exceed CLIP limit
+        assert n_template_tokens + class_max_length <= 77, f"Total length {n_template_tokens + class_max_length} exceeds CLIP limit of 77"
 
-        # Freeze text encoder
+        # learnable global template vectors (initialized randomly or from template_init)
+        if template_init is None:
+            template_init = torch.randn(n_template_tokens, self.hidden_size) * 0.02
+        self.global_template = torch.nn.Parameter(template_init.to(self.device))  # shape [n_template_tokens, D]
+
+        # keep text encoder frozen (we want to update only the global template)
         for p in self.text_encoder.parameters():
             p.requires_grad = False
-            
-        print(f"Initialized {self.num_classes} learnable embeddings")
 
-    def get_prompt_embeds(self):
+    def get_prompt_embeds(self, classnames, max_length=None):
         """
-        Create embeddings by replacing class name positions with learned embeddings
+        Create embeddings by concatenating global template + class name embeddings
+        Uses fixed lengths: n_template_tokens + class_max_length = 77 exactly
         """
-        # Start with base embeddings
-        prompt_embeds = self.base_embeddings.clone()
+        # Encode class names with controlled length
+        enc = self.tokenizer(
+            classnames,
+            padding="max_length",
+            truncation=True,
+            max_length=self.class_max_length,
+            return_tensors="pt"
+        )
+        input_ids = enc["input_ids"].to(self.device)            # [B, class_max_length]
+        attention_mask = enc["attention_mask"].to(self.device)  # [B, class_max_length]
+
+        # Get class name embeddings through the text encoder
+        with torch.no_grad():
+            class_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+            class_embeds = class_outputs.last_hidden_state  # [B, class_max_length, D]
         
-        # Replace class-specific positions with learned embeddings
-        for i in range(self.num_classes):
-            pos = self.class_positions[i]
-            prompt_embeds[i, pos] = self.learned_embeddings[i]
+        B, L, D = class_embeds.shape
+        assert L == self.class_max_length
+        assert D == self.hidden_size
+
+        # Expand global template for batch
+        template_expand = self.global_template.unsqueeze(0).expand(B, -1, -1)  # [B, n_template_tokens, D]
+        template_expand = template_expand.to(class_embeds.dtype)
         
-        # Pass through text encoder
-        # Create position embeddings
-        batch_size, seq_len = prompt_embeds.shape[0], prompt_embeds.shape[1]
-        position_ids = torch.arange(seq_len, dtype=torch.long, device=self.device).unsqueeze(0).expand(batch_size, -1)
+        # Concatenate global template + class embeddings
+        # This will be exactly n_template_tokens + class_max_length = 77 tokens
+        combined_embeds = torch.cat([template_expand, class_embeds], dim=1)  # [B, 77, D]
+        
+        # Create attention mask for combined embeddings
+        template_mask = torch.ones((B, self.n_template_tokens), device=self.device, dtype=attention_mask.dtype)
+        combined_attention_mask = torch.cat([template_mask, attention_mask], dim=1)  # [B, 77]
+
+        # Process through text encoder transformer layers manually to get final representations
+        # We need to bypass the embedding layer since we already have embeddings
+        
+        # Get position embeddings for full sequence
+        seq_length = combined_embeds.shape[1]  # Should be 77
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=self.device).unsqueeze(0).expand(B, -1)
         position_embeds = self.text_encoder.text_model.embeddings.position_embedding(position_ids)
         
-        # Combine token + position embeddings
-        embeddings = prompt_embeds + position_embeds
+        # Add position embeddings
+        embeddings = combined_embeds + position_embeds
         
-        # Create attention mask for encoder (convert to 4D)
-        extended_attention_mask = self.attention_mask[:, None, None, :]
+        # Create extended attention mask for encoder
+        extended_attention_mask = combined_attention_mask[:, None, None, :]
         extended_attention_mask = extended_attention_mask.to(dtype=embeddings.dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         
-        # Pass through encoder
+        # Pass through the encoder
         encoder_outputs = self.text_encoder.text_model.encoder(
             inputs_embeds=embeddings,
             attention_mask=extended_attention_mask
         )
         
         hidden_states = encoder_outputs.last_hidden_state
+        
+        # Apply final layer norm
         hidden_states = self.text_encoder.text_model.final_layer_norm(hidden_states)
         
         return hidden_states
+    
+    def get_global_template(self):
+        """Return the learned global template for inspection or reuse"""
+        return self.global_template.detach()
+    
+    def save(self, path: str):
+        """Save the learned global template."""
+        torch.save(self.state_dict(), path)
 
-def working_training_step(prompt_learner,
-                         vae,
+    def load(self, path: str, map_location=None):
+        """Load the learned global template."""
+        state = torch.load(path, map_location=map_location)
+        self.load_state_dict(state)
+
+def prompt_training_step(template_learner,
                          unet,
                          scheduler,
-                         images,
-                         labels,
+                         latents,      # [B, 4, H, W] (already on device)
+                         labels,       # [B] (long tensor, values in [0..C-1])
+                         classnames,   # list[str] length C
                          optimizer,
                          device,
-                         temperature=0.07):  # Lower temperature for sharper distributions
+                         loss_kind='l2'):
     """
-    Fixed training step with proper scaling
+    MEMORY-OPTIMIZED version:
+    Instead of expanding batch to B*C, process each class separately to save memory
     """
-    prompt_learner.train()
-    unet.eval()
-    vae.eval()
-    
-    # Ensure frozen models don't compute gradients
+    template_learner.train()
+    unet.eval()   # unet frozen in eval mode (no dropout etc). ensure params require_grad=False
     for p in unet.parameters():
         p.requires_grad = False
-    for p in vae.parameters():
-        p.requires_grad = False
 
-    B = images.shape[0]
-    C = prompt_learner.num_classes
+    B = latents.shape[0]
+    C = len(classnames)
 
-    # Encode images to latents
-    with torch.no_grad():  # VAE doesn't need gradients for prompt learning
-        latents = vae.encode(images).latent_dist.sample()
-        latents = latents * vae.config.scaling_factor
+    # 1) get class prompt embeddings with global template: [C, L, D]
+    prompt_embeds = template_learner.get_prompt_embeds(classnames)  # on device
 
-    # Get prompt embeddings for all classes
-    prompt_embeds = prompt_learner.get_prompt_embeds()  # [C, L, D]
+    # 2) sample noise and timesteps per image
+    T = scheduler.config.num_train_timesteps if hasattr(scheduler.config, "num_train_timesteps") else len(scheduler.alphas_cumprod)
+    timesteps = torch.randint(0, T, (B,), device=device, dtype=torch.long)  # one t per image
+    noise = torch.randn_like(latents, device=device)  # [B, 4, H, W]
 
-    # Sample noise and timestep
-    T = scheduler.config.num_train_timesteps
-    timesteps = torch.randint(0, T, (B,), device=device, dtype=torch.long)
-    noise = torch.randn_like(latents, device=device)
-
-    # Add noise to latents
-    alphas_cumprod = scheduler.alphas_cumprod.to(device)
+    # 3) compute noised latents (vectorized)
+    alphas_cumprod = scheduler.alphas_cumprod.to(device)  # ensure on device
     a = alphas_cumprod[timesteps].view(B, 1, 1, 1).sqrt()
     one_minus_a = (1 - alphas_cumprod[timesteps]).view(B, 1, 1, 1).sqrt()
-    noised = latents * a + noise * one_minus_a
+    noised = latents * a + noise * one_minus_a  # [B, 4, H, W]
 
-    # Calculate reconstruction losses for each class
-    losses = torch.zeros(B, C, device=device)
+    # Memory-optimized approach - process classes one by one
+    losses_per_pair = torch.zeros(B, C, device=device)
     
     for c in range(C):
-        # Get prompt for class c
+        # Get prompt embedding for this class
         pe_c = prompt_embeds[c:c+1].expand(B, -1, -1)  # [B, L, D]
         
-        # Forward through UNet
-        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(images.dtype == torch.float16)):
+        # Forward through UNet for this class
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(next(unet.parameters()).dtype == torch.float16)):
             out = unet(noised, timesteps, encoder_hidden_states=pe_c)
-        noise_pred = out.sample
+        noise_pred = out.sample  # [B, 4, H, W]
         
-        # Compute MSE loss per sample
-        loss_per_sample = F.mse_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2, 3))
-        losses[:, c] = loss_per_sample
+        # Compute loss for this class
+        if loss_kind == 'l2':
+            errs = F.mse_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2, 3))  # [B]
+        elif loss_kind == 'l1':
+            errs = F.l1_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2, 3))
+        else:
+            raise NotImplementedError
+            
+        losses_per_pair[:, c] = errs
 
-    # Convert to logits with temperature scaling
-    # Lower loss = better reconstruction = higher probability
-    logits = -losses / temperature
-    
-    # Compute classification loss
+    # 4) logits: lower loss -> higher score, so use negative loss as logits
+    logits = -losses_per_pair  # [B, C]
+
+    # 5) classification loss
     ce_loss = F.cross_entropy(logits, labels.to(device))
-    
-    # Backward pass
+
+    # 6) step
     optimizer.zero_grad()
     ce_loss.backward()
-    
-    # Gradient clipping
-    torch.nn.utils.clip_grad_norm_(prompt_learner.parameters(), max_norm=1.0)
-    
     optimizer.step()
-    
-    # Calculate accuracy
-    predictions = torch.argmax(logits, dim=1)
-    accuracy = (predictions == labels.to(device)).float().mean().item()
-    
-    return ce_loss.item(), accuracy, logits.detach()
+
+    return ce_loss.item()
 
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
@@ -215,18 +208,17 @@ def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     ])
     return transform
 
-def run_working(args):
-    print("=== WORKING PROMPT LEARNING ===")
-    
+def run(args):
+
     transform = get_transform()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    
     dataset = datasets.CIFAR10(root=DATASET_ROOT, train=(args.split == 'train'), download=True, transform=transform)
     classnames = dataset.classes
-    print(f"Classes: {classnames}")
-    
+    #dataset = get_target_dataset(args.dataset, train=args.split == 'train', transform=transform)
     vae, tokenizer, text_encoder, unet, scheduler = get_sd_model(args)
+
+    #dtype_map = {'float16': torch.float16, 'float32': torch.float32}
+    #torch_dtype = dtype_map[args.dtype]    
     
     vae = vae.to(device)
     unet = unet.to(device)
@@ -237,14 +229,18 @@ def run_working(args):
         unet = unet.half()
         vae = vae.half()
 
-    # Create working prompt learner
-    prompt_learner = WorkingPromptLearner(tokenizer, text_encoder, classnames, device=device).to(device)
+    # Use the new TemplatePromptLearner with controlled lengths
+    # Using 32 template tokens + 45 class tokens = 77 total (fits perfectly in CLIP)
+    template_learner = TemplatePromptLearner(
+        tokenizer, 
+        text_encoder, 
+        n_template_tokens=32, 
+        class_max_length=45, 
+        device=device
+    ).to(device)
     
-    # Use a higher learning rate since we're learning meaningful representations
-    optimizer = torch.optim.AdamW([prompt_learner.learned_embeddings], lr=1e-2, weight_decay=1e-5)
-    
-    # Learning rate scheduler
-    scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10*len(dataset))
+    # Optimizer only updates the global template
+    optimizer = torch.optim.AdamW([template_learner.global_template], lr=1e-3)
 
     train_loader = DataLoader(
         dataset,
@@ -253,50 +249,47 @@ def run_working(args):
         pin_memory=True
     )
 
-    print("\n=== Starting Working Training ===")
-    
     for epoch in range(10):
-        print(f"\nEpoch {epoch + 1}/10")
-        epoch_losses = []
-        epoch_accuracies = []
-        
+        print(f"Epoch {epoch + 1}/10")
         for batch_idx, (images_batch, labels_batch) in enumerate(train_loader):
-            
             if args.dtype == 'float16':
                 images_batch = images_batch.to(device).half()
             else:
                 images_batch = images_batch.to(device).float()
+                
+            with torch.no_grad():
+                latents_batch = vae.encode(images_batch).latent_dist.mean
+                latents_batch *= 0.18215
 
-            loss_val, accuracy, logits = working_training_step(
-                prompt_learner, vae, unet, scheduler,
-                images_batch, labels_batch,
-                optimizer, device
+            loss_val = prompt_training_step(
+                template_learner, unet, scheduler,
+                latents_batch, labels_batch,
+                classnames, optimizer, device
             )
             
-            scheduler_lr.step()  # Update LR every step
-            
-            epoch_losses.append(loss_val)
-            epoch_accuracies.append(accuracy)
-            
             if batch_idx % 10 == 0:
-                print(f"Batch {batch_idx}, Loss: {loss_val:.6f}, Accuracy: {accuracy:.4f}")
-                print(f"Logits: {logits[0][:5]}")  # Show first 5 logits
-                
-        # Epoch summary
-        avg_loss = np.mean(epoch_losses)
-        avg_accuracy = np.mean(epoch_accuracies) 
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch + 1} Summary - Loss: {avg_loss:.6f}, Accuracy: {avg_accuracy:.4f}, LR: {current_lr:.2e}")
+                print(f"Batch {batch_idx}, train loss: {loss_val}")
+        
+        # Print template stats for monitoring
+        if epoch % 2 == 0:
+            template = template_learner.get_global_template()
+            print(f"Template norm: {template.norm().item():.4f}, mean: {template.mean().item():.4f}")
     
-    # Save the model
-    save_path = "templates/working_prompt_learner.pt"
-    torch.save(prompt_learner.state_dict(), save_path)
-    print(f"Saved working prompt learner to {save_path}")
+    save_path = "templates/global_template_learner.pt"
+    template_learner.save(save_path)
+    print(f"Saved learned global template to {save_path}")
+
+    # Optionally save just the template embedding for reuse
+    template_embedding_path = "templates/global_template_embedding.pt"
+    torch.save(template_learner.get_global_template(), template_embedding_path)
+    print(f"Saved global template embedding to {template_embedding_path}")
+
 
 def main():
     parser = argparse.ArgumentParser()
+
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
-    parser.add_argument('--dtype', type=str, default='float32', choices=('float16', 'float32'),
+    parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
                             help='Model data type to use')
     parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
@@ -304,7 +297,7 @@ def main():
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
 
     args = parser.parse_args()
-    run_working(args)
+    run(args)
 
 if __name__ == "__main__":
     main()
