@@ -18,37 +18,12 @@ Moreover traditional diffusion-based classification evaluates all classes simult
 
 Both approaches use CLIP embeddings to build semantic hierarchies of class labels, allowing for more efficient and interpretable classification.
 
-## Project Structure
-
-```
-diffusion-classifier/
-├── diffusion_classifier.py                 # Original classification script (enhanced)
-├── learnable_templates.py                  # Core template learning modules
-├── diffusion_integration.py                # Template training script  
-├── clustering_diffusion_classifier.py      # Hierarchical clustering modules
-├── beam_search_diffusion_classifier.py     # Hierarchical clustering using beam search modules
-├── diffusion/                              # Original diffusion utilities
-│   ├── datasets.py
-│   ├── models.py
-│   └── utils.py
-├── trained_templates/                      # Saved template checkpoints
-│   └── templates_[dataset]/
-│       ├── best_templates.pt
-│       ├── templates_epoch_*.pt
-│       └── checkpoint_epoch_*.pt
-
-```
-
 
 ## Installation
 
 Create a conda environment with the following command:
 ```bash
 conda env create -f environment.yml
-```
-or create a virtual environment and use pip:
-```bash
-pip install -r requirements.txt
 ```
 
 ## Usage
@@ -82,19 +57,11 @@ python diffusion_classifier.py \
 Train optimal templates for a specific dataset:
 
 ```bash
-python diffusion_integration.py \
+python learnable_templates.py \
     --dataset cifar10 \
     --split train \
-    --to_keep 5 1 \
-    --n_samples 50 500 \
-    --loss l1 \
-    --n_trials 1 \
-    --num_templates 4 \
-    --learning_rate 1e-3 \
-    --num_epochs 10 \
-    --batch_size 4 \
-    --samples_per_class 100 \
-    --save_dir ./trained_templates
+    --version 2-0 \
+    --dtype float16 \
 ```
 
 Evaluation with Learned Templates
@@ -103,13 +70,12 @@ Evaluation with Learned Templates
 python diffusion_classifier.py \
     --dataset cifar10 \
     --split test \
-    --prompt_path prompts/cifar10_prompts.csv \
     --to_keep 5 1 \
     --n_samples 50 500 \
     --loss l1 \
     --n_trials 1 \
     --samples_per_class 100 \
-    --template_path ./trained_templates/templates_pets/best_templates.pt
+    --template_path ./templates/prompt_learner{i}.pt
 ```
 
 ### 3. Hierarchical Clustering Approach
