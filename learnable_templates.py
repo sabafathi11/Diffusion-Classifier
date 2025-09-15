@@ -1,345 +1,294 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from transformers import CLIPTextModel, CLIPTokenizer
-from typing import List, Dict, Optional, Tuple
+import argparse
 import numpy as np
-from dataclasses import dataclass
-from transformers import CLIPTextModel, CLIPTokenizer
+import torch
+import torch.nn.functional as F
+from diffusion.models import get_sd_model
+import torchvision.transforms as torch_transforms
+from torchvision.transforms.functional import InterpolationMode
+from torchvision import datasets
+from diffusion.utils import DATASET_ROOT
+from torch.utils.data import DataLoader
+from diffusion.datasets import get_target_dataset
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+seed = 42
+
+torch.manual_seed(seed)             # sets seed for CPU
+torch.cuda.manual_seed(seed)        # sets seed for current GPU
+torch.cuda.manual_seed_all(seed)    # sets seed for all GPUs (if you use multi-GPU)
+np.random.seed(seed) 
 
 
-@dataclass
-class TemplateConfig:
-    """Configuration for learnable templates"""
-    num_templates: int = 4 # Number of learnable templates
-    template_dim: int = 1024  # Dimension of learned template embeddings
-    text_encoder_dim: int = 1024  # CLIP text encoder dimension
-    max_length: int = 77  # Max sequence length for CLIP
-    learning_rate: float = 1e-3
-    temperature: float = 1.0  # For Gumbel softmax
-    regularization_weight: float = 0.01
-
-
-class LearnableTemplateEmbeddings(nn.Module):
+class PromptLearner(torch.nn.Module):
     """
-    Learnable template embeddings that generate different tokens for each sequence position
+    Learn a single GLOBAL prompt (n_ctx vectors) and insert them into the
+    text encoder input embeddings. Returns text encoder last_hidden_state
+    with shape [n_prompts, seq_len, hidden_dim] — compatible with UNet's
+    `encoder_hidden_states`.
     """
-    def __init__(self, config: TemplateConfig):
+    def __init__(self, tokenizer, text_encoder, n_ctx=8, ctx_init=None, device=None):
         super().__init__()
-        self.config = config
-        
-        # Learnable template embeddings for each sequence position
-        self.template_embeddings = nn.Parameter(
-            torch.randn(config.num_templates, config.max_length, config.template_dim)
-        )
-        
-        # Projection layer to convert template embeddings to text encoder space
-        self.template_projector = nn.Sequential(
-            nn.Linear(config.template_dim, config.text_encoder_dim),
-            nn.ReLU(),
-            nn.Linear(config.text_encoder_dim, config.text_encoder_dim),
-            nn.LayerNorm(config.text_encoder_dim)
-        )
-        
-        # Initialize embeddings with Xavier initialization
-        nn.init.xavier_uniform_(self.template_embeddings)
-        
-    def forward(self, template_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass to get template embeddings
-        
-        Args:
-            template_indices: If provided, select specific templates. Otherwise return all.
-            
-        Returns:
-            Template embeddings projected to text encoder space: [num_templates, seq_len, embed_dim]
-        """
-        if template_indices is not None:
-            selected_embeddings = self.template_embeddings[template_indices]
-        else:
-            selected_embeddings = self.template_embeddings
-            
-        # Project each sequence position
-        batch_size, seq_len, template_dim = selected_embeddings.shape
-        flat_embeddings = selected_embeddings.reshape(-1, template_dim)
-        projected_flat = self.template_projector(flat_embeddings)
-        projected = projected_flat.reshape(batch_size, seq_len, self.config.text_encoder_dim)
-        
-        return projected
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+        self.n_ctx = n_ctx
+        self.device = device if device is not None else next(text_encoder.parameters()).device
+        self.hidden_size = text_encoder.config.hidden_size
 
+        # learnable ctx vectors (initialized randomly or from ctx_init)
+        if ctx_init is None:
+            ctx_init = torch.randn(n_ctx, self.hidden_size) * 0.02
+        self.ctx = torch.nn.Parameter(ctx_init.to(self.device))  # shape [n_ctx, D]
 
-class TemplateTextEncoder(nn.Module):
-    """
-    Combines learnable templates with class labels to create text embeddings
-    """
-    def __init__(self, config: TemplateConfig, model_name: str = "stabilityai/stable-diffusion-2"):
-        super().__init__()
-        config = TemplateConfig()
-        self.config = config
+        # keep text encoder frozen (we want to update only ctx)
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
 
-        # Load tokenizer and text encoder from SD v2 model
-        self.tokenizer = CLIPTokenizer.from_pretrained(model_name, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder")
-        
-        # Freeze text encoder weights initially
-        for param in self.text_encoder.parameters():
-            param.requires_grad = False
-            
-        # Learnable template embeddings
-        self.template_embeddings = LearnableTemplateEmbeddings(config)
-        
-        # Template combination layer
-        self.template_combiner = nn.MultiheadAttention(
-            embed_dim=config.text_encoder_dim,
-            num_heads=8,
-            batch_first=True
-        )
-        
-        # Class name embedding cache
-        self.class_embeddings_cache = {}
-        
-    def encode_class_names(self, class_names: List[str]) -> torch.Tensor:
-        """
-        Encode class names using CLIP text encoder
-        """
-        # Create cache key
-        cache_key = tuple(sorted(class_names))
-        
-        if cache_key in self.class_embeddings_cache:
-            return self.class_embeddings_cache[cache_key]
-            
-        # Tokenize class names
-        tokens = self.tokenizer(
-            class_names,
-            padding=True,
+    def get_prompt_embeds(self, classnames, max_length=None):
+        enc = self.tokenizer(
+            classnames,
+            padding="max_length",
             truncation=True,
-            max_length=self.config.max_length,
+            max_length=77,
             return_tensors="pt"
         )
+        input_ids = enc["input_ids"].to(self.device)            # [B, L]
+        attention_mask = enc["attention_mask"].to(self.device)  # [B, L]
+
+        token_embeds = self.text_encoder.get_input_embeddings()(input_ids)  # [B, L, D]
+        B, L, D = token_embeds.shape
+        assert D == self.hidden_size
+
+        if self.n_ctx >= L:
+            raise ValueError("n_ctx must be < sequence length")
+
+        prefix = token_embeds[:, :1, :]                                # BOS
+        suffix = token_embeds[:, 1 + self.n_ctx:, :]                  # FIXED: start from 1 + n_ctx
+        ctx_expand = self.ctx.unsqueeze(0).expand(B, -1, -1)           # [B, n_ctx, D]
+
+        # Ensure all tensors have the same dtype
+        ctx_expand = ctx_expand.to(token_embeds.dtype)
         
-        # Get embeddings
-        with torch.no_grad():
-            device = next(self.text_encoder.parameters()).device
-            tokens = {k: v.to(device) for k, v in tokens.items()}
-            outputs = self.text_encoder(**tokens)
-            class_embeddings = outputs.last_hidden_state[:, 0]  # Use [CLS] token
-            
-        self.class_embeddings_cache[cache_key] = class_embeddings
-        return class_embeddings
-    
-    def combine_template_and_class(
-        self, 
-        template_embeddings: torch.Tensor, 
-        class_embeddings: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Combine template and class embeddings using attention
+        new_inputs_embeds = torch.cat([prefix, ctx_expand, suffix], dim=1)
         
-        Args:
-            template_embeddings: [num_templates, seq_len, embed_dim]
-            class_embeddings: [num_classes, embed_dim]
-            
-        Returns:
-            Combined embeddings: [num_templates, num_classes, seq_len, embed_dim]  
-        """
-        num_templates, seq_len, embed_dim = template_embeddings.shape
-        num_classes = class_embeddings.shape[0]
+        # FIXED: Handle padding properly
+        if new_inputs_embeds.shape[1] < L:
+            padding_size = L - new_inputs_embeds.shape[1]
+            padding = torch.zeros(B, padding_size, D, device=self.device, dtype=new_inputs_embeds.dtype)
+            new_inputs_embeds = torch.cat([new_inputs_embeds, padding], dim=1)
+        new_inputs_embeds = new_inputs_embeds[:, :L, :]                # ensure length = 77
+
+        # FIXED: Handle attention mask properly and ensure correct dtype
+        prefix_mask = attention_mask[:, :1]
+        ctx_mask = torch.ones((B, self.n_ctx), device=self.device, dtype=attention_mask.dtype)
+        suffix_mask = attention_mask[:, 1 + self.n_ctx:]
         
-        # Expand class embeddings to sequence length
-        class_embeddings_seq = class_embeddings.unsqueeze(1).expand(-1, seq_len, -1)
+        new_attention_mask = torch.cat([prefix_mask, ctx_mask, suffix_mask], dim=1)
         
-        # Expand dimensions for combination
-        templates_expanded = template_embeddings.unsqueeze(1).expand(-1, num_classes, -1, -1)
-        classes_expanded = class_embeddings_seq.unsqueeze(0).expand(num_templates, -1, -1, -1)
+        if new_attention_mask.shape[1] < L:
+            padding_size = L - new_attention_mask.shape[1]
+            padding = torch.zeros((B, padding_size), device=self.device, dtype=attention_mask.dtype)
+            new_attention_mask = torch.cat([new_attention_mask, padding], dim=1)
+        new_attention_mask = new_attention_mask[:, :L]                 # ensure length = 77
         
-        # Combine by addition or concatenation - here using addition
-        combined = templates_expanded + classes_expanded
+        # FIXED: Don't convert attention mask dtype - keep it as integers for proper processing
+        # The attention mask should remain as integers (0s and 1s)
         
-        return combined
-    def forward(self, class_names: List[str], template_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Generate text embeddings for all template-class combinations
+        # Manually pass through the text model components
+        # Get position embeddings
+        seq_length = new_inputs_embeds.shape[1]
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=self.device).unsqueeze(0).expand(B, -1)
+        position_embeds = self.text_encoder.text_model.embeddings.position_embedding(position_ids)
         
-        Args:
-            class_names: List of class names
-            template_indices: Optional specific template indices to use
-            
-        Returns:
-            Combined embeddings: [num_templates, num_classes, seq_len, embed_dim]
-        """
-        # Get template embeddings
-        template_embeddings = self.template_embeddings(template_indices)
+        # Combine token embeddings with position embeddings
+        embeddings = new_inputs_embeds + position_embeds
         
-        # Get class embeddings
-        class_embeddings = self.encode_class_names(class_names)
-        # Move to same device
-        class_embeddings = class_embeddings.to(template_embeddings.device)
+        # FIXED: Create extended attention mask for encoder
+        # Convert 2D attention mask to 4D for multi-head attention
+        # Shape: [batch_size, seq_len] -> [batch_size, 1, 1, seq_len]
+        extended_attention_mask = new_attention_mask[:, None, None, :]
         
-        # Combine template and class embeddings
-        combined_embeddings = self.combine_template_and_class(
-            template_embeddings, class_embeddings
+        # Convert to float and apply masking values
+        # 1.0 for tokens that should be attended to, large negative for padding
+        extended_attention_mask = extended_attention_mask.to(dtype=embeddings.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        
+        # Pass through the encoder with properly formatted attention mask
+        encoder_outputs = self.text_encoder.text_model.encoder(
+            inputs_embeds=embeddings,
+            attention_mask=extended_attention_mask
         )
         
-        return combined_embeddings
-
-
-class TemplateLearner(nn.Module):
-    """
-    Main module for learning optimal templates for diffusion classification
-    """
-    def __init__(self, config: TemplateConfig, class_names: List[str]):
-        super().__init__()
-        self.config = config
-        self.class_names = class_names
-        self.num_classes = len(class_names)
+        hidden_states = encoder_outputs.last_hidden_state
         
-        # Template text encoder
-        self.template_encoder = TemplateTextEncoder(config)
+        # Apply final layer norm
+        hidden_states = self.text_encoder.text_model.final_layer_norm(hidden_states)
         
-        # Template selection network (for dynamic template selection)
-        self.template_selector = nn.Sequential(
-            nn.Linear(config.text_encoder_dim, config.num_templates * 2),
-            nn.ReLU(),
-            nn.Linear(config.num_templates * 2, config.num_templates),
-            nn.Softmax(dim=-1)
-        )
-        
-        # Diversity regularization
-        self.diversity_loss_fn = nn.MSELoss()
-        
-    def compute_diversity_loss(self, template_embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        Encourage diversity among template embeddings
-        """
-        # Compute pairwise similarities
-        # template_embeddings shape: (num_templates, num_classes, seq_len, embed_dim)
-        flattened = template_embeddings.view(template_embeddings.size(0), -1)  # (num_templates, num_classes * seq_len * embed_dim)
-        norm_embeddings = F.normalize(flattened, p=2, dim=1)
-        similarity_matrix = torch.mm(norm_embeddings, norm_embeddings.t())
-        
-        # We want off-diagonal elements to be small (diverse templates)
-        mask = ~torch.eye(template_embeddings.size(0), dtype=torch.bool, device=template_embeddings.device)
-        diversity_loss = similarity_matrix[mask].pow(2).mean()
-        
-        return diversity_loss
+        return hidden_states
     
-    def select_best_template(
-        self, 
-        losses_per_template: torch.Tensor, 
-        use_gumbel: bool = True
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Select best template based on losses
+    def save(self, path: str):
+        """Save the learned context vectors (and any other parameters)."""
+        torch.save(self.state_dict(), path)
+
+    def load(self, path: str, map_location=None):
+        """Load the learned context vectors."""
+        state = torch.load(path, map_location=map_location)
+        self.load_state_dict(state)
+
+def prompt_training_step(prompt_learner,
+                         unet,
+                         scheduler,
+                         latents,      # [B, 4, H, W] (already on device)
+                         labels,       # [B] (long tensor, values in [0..C-1])
+                         classnames,   # list[str] length C
+                         optimizer,
+                         device,
+                         loss_kind='l2'):
+    """
+    MEMORY-OPTIMIZED version:
+    Instead of expanding batch to B*C, process each class separately to save memory
+    """
+    prompt_learner.train()
+    unet.eval()   # unet frozen in eval mode (no dropout etc). ensure params require_grad=False
+    for p in unet.parameters():
+        p.requires_grad = False
+
+    B = latents.shape[0]
+    C = len(classnames)
+
+    # 1) get class prompt embeddings: [C, L, D]
+    prompt_embeds = prompt_learner.get_prompt_embeds(classnames)  # on device
+
+    # 2) sample noise and timesteps per image
+    T = scheduler.config.num_train_timesteps if hasattr(scheduler.config, "num_train_timesteps") else len(scheduler.alphas_cumprod)
+    timesteps = torch.randint(0, T, (B,), device=device, dtype=torch.long)  # one t per image
+    noise = torch.randn_like(latents, device=device)  # [B, 4, H, W]
+
+    # 3) compute noised latents (vectorized)
+    alphas_cumprod = scheduler.alphas_cumprod.to(device)  # ensure on device
+    a = alphas_cumprod[timesteps].view(B, 1, 1, 1).sqrt()
+    one_minus_a = (1 - alphas_cumprod[timesteps]).view(B, 1, 1, 1).sqrt()
+    noised = latents * a + noise * one_minus_a  # [B, 4, H, W]
+
+    # FIXED: Memory-optimized approach - process classes one by one
+    losses_per_pair = torch.zeros(B, C, device=device)
+    
+    for c in range(C):
+        # Get prompt embedding for this class
+        pe_c = prompt_embeds[c:c+1].expand(B, -1, -1)  # [B, L, D]
         
-        Args:
-            losses_per_template: [num_templates] tensor of losses
-            use_gumbel: Whether to use Gumbel softmax for differentiability
-            
-        Returns:
-            Selected template logits and hard selection
-        """
-        # Convert losses to logits (lower loss = higher probability)
-        logits = -losses_per_template / self.config.temperature
+        # Forward through UNet for this class
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(next(unet.parameters()).dtype == torch.float16)):
+            out = unet(noised, timesteps, encoder_hidden_states=pe_c)
+        noise_pred = out.sample  # [B, 4, H, W]
         
-        if use_gumbel and self.training:
-            # Gumbel softmax for differentiable discrete selection
-            selection_soft = F.gumbel_softmax(logits, tau=self.config.temperature, hard=False)
-            selection_hard = F.gumbel_softmax(logits, tau=self.config.temperature, hard=True)
-            
-            # Straight-through estimator
-            selection = selection_hard - selection_soft.detach() + selection_soft
+        # Compute loss for this class
+        if loss_kind == 'l2':
+            errs = F.mse_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2, 3))  # [B]
+        elif loss_kind == 'l1':
+            errs = F.l1_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2, 3))
         else:
-            # Hard selection during evaluation
-            selection = torch.zeros_like(logits)
-            best_idx = torch.argmin(losses_per_template)
-            selection[best_idx] = 1.0
+            raise NotImplementedError
             
-        return logits, selection
-    
-    def compute_classification_loss(
-        self, 
-        diffusion_losses: torch.Tensor, 
-        true_labels: torch.Tensor,
-        temperature: float = 1.0
-    ) -> torch.Tensor:
-        """
-        Compute differentiable classification loss from diffusion losses
-        
-        Args:
-            diffusion_losses: [batch_size, num_templates, num_classes]
-            true_labels: [batch_size]
-            temperature: Temperature for softmax (lower = more confident)
-            
-        Returns:
-            Classification loss per template
-        """
-        batch_size, num_templates, num_classes = diffusion_losses.shape
-        
-        # Convert losses to logits (lower loss = higher probability)
-        # Negative because we want lower losses to have higher probabilities
-        logits = -diffusion_losses / temperature  # [batch_size, num_templates, num_classes]
-        
-        # Compute cross-entropy loss for each template
-        template_losses = []
-        for t in range(num_templates):
-            template_logits = logits[:, t, :]  # [batch_size, num_classes]
-            device = 'cuda' if template_logits.is_cuda else 'cpu'
-            template_logits = template_logits.to(device)
-            true_labels = true_labels.to(device)
-            loss = F.cross_entropy(template_logits, true_labels)
-            template_losses.append(loss)
-        
-        return torch.stack(template_losses)  # [num_templates]
-    
-    def forward(
-        self, 
-        diffusion_losses: torch.Tensor, 
-        true_labels: torch.Tensor,
-        return_embeddings: bool = False
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass for template learning
-        
-        Args:
-            diffusion_losses: [batch_size, num_templates, num_classes] 
-            true_labels: [batch_size]
-            return_embeddings: Whether to return template embeddings
-            
-        Returns:
-            Dictionary with losses and optionally embeddings
-        """
-        # Get template embeddings
-        template_embeddings = self.template_encoder.template_embeddings()
-        
-        # Compute classification loss for each template
-        classification_losses = self.compute_classification_loss(diffusion_losses, true_labels)
-        
-        # Select best template
-        template_logits, template_selection = self.select_best_template(classification_losses)
-        
-        # Compute final classification loss (weighted by template selection)
-        final_classification_loss = torch.sum(template_selection * classification_losses)
-        
-        # Compute diversity loss
-        diversity_loss = self.compute_diversity_loss(template_embeddings)
-        
-        # Total loss
-        total_loss = (
-            final_classification_loss + 
-            self.config.regularization_weight * diversity_loss
-        )
-        
-        results = {
-            'total_loss': total_loss,
-            'classification_loss': final_classification_loss,
-            'diversity_loss': diversity_loss,
-            'template_logits': template_logits,
-            'template_selection': template_selection,
-            'classification_losses_per_template': classification_losses
-        }
-        
-        if return_embeddings:
-            results['template_embeddings'] = template_embeddings
-            
-        return results
+        losses_per_pair[:, c] = errs
 
+    # 4) logits: lower loss -> higher score, so use negative loss as logits
+    logits = -losses_per_pair  # [B, C]
+
+    # 5) classification loss
+    ce_loss = F.cross_entropy(logits, labels.to(device))
+
+    # 6) step
+    optimizer.zero_grad()
+    ce_loss.backward()
+    optimizer.step()
+
+    return ce_loss.item()
+
+def _convert_image_to_rgb(image):
+    return image.convert("RGB")
+
+def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
+    transform = torch_transforms.Compose([
+        torch_transforms.Resize(size, interpolation=interpolation),
+        torch_transforms.CenterCrop(size),
+        _convert_image_to_rgb,
+        torch_transforms.ToTensor(),
+        torch_transforms.Normalize([0.5], [0.5])
+    ])
+    return transform
+
+def run(args):
+
+    transform = get_transform()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dataset = datasets.CIFAR10(root=DATASET_ROOT, train=(args.split == 'train'), download=True, transform=transform)
+    classnames = dataset.classes
+    #dataset = get_target_dataset(args.dataset, train=args.split == 'train', transform=transform)
+    vae, tokenizer, text_encoder, unet, scheduler = get_sd_model(args)
+
+    #dtype_map = {'float16': torch.float16, 'float32': torch.float32}
+    #torch_dtype = dtype_map[args.dtype]    
+    
+    vae = vae.to(device)
+    unet = unet.to(device)
+    text_encoder = text_encoder.to(device)
+
+    if args.dtype == 'float16':
+        text_encoder = text_encoder.half()
+        unet = unet.half()
+        vae = vae.half()
+
+    prompt_learner = PromptLearner(tokenizer, text_encoder, n_ctx=8, device=device).to(device)
+    optimizer = torch.optim.AdamW([prompt_learner.ctx], lr=1e-3)
+
+    train_loader = DataLoader(
+        dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    for epoch in range(10):
+        print(f"Epoch {epoch + 1}/10")
+        for batch_idx, (images_batch, labels_batch) in enumerate(train_loader):
+            if args.dtype == 'float16':
+                images_batch = images_batch.to(device).half()
+            else:
+                images_batch = images_batch.to(device).float()
+                
+            with torch.no_grad():
+                latents_batch = vae.encode(images_batch).latent_dist.mean
+                latents_batch *= 0.18215
+
+            loss_val = prompt_training_step(
+                prompt_learner, unet, scheduler,
+                latents_batch, labels_batch,
+                classnames, optimizer, device
+            )
+            
+            if batch_idx % 10 == 0:
+                print(f"Batch {batch_idx}, train loss: {loss_val}")
+    
+    save_path = "templates/prompt_learner1.pt"
+    prompt_learner.save(save_path)
+    print(f"Saved learned prompt to {save_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
+    parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
+                            help='Model data type to use')
+    parser.add_argument('--dataset', type=str, default='cifar10',
+                        choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
+                                 'objectnet', 'aircraft'], help='Dataset to use')
+    parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
+
+    args = parser.parse_args()
+    run(args)
+
+if __name__ == "__main__":
+    main()

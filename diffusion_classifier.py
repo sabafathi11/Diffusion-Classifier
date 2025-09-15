@@ -12,10 +12,10 @@ from diffusion.utils import LOG_DIR, get_formatstr
 import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 from collections import defaultdict
-from learnable_templates import TemplateLearner, TemplateConfig, TemplateTextEncoder
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
+from learnable_templates import PromptLearner
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -92,11 +92,9 @@ class DiffusionEvaluator:
         # Set up models and other components
         self._setup_models()
         self._setup_dataset()
-        if self.args.prompt_path is not None:
-            self._setup_prompts()
+        self._setup_prompts()
         self._setup_noise()
         self._setup_run_folder()
-        self._setup_learned_templates()
         self._setup_class_names()
   
         
@@ -116,20 +114,28 @@ class DiffusionEvaluator:
         self.target_dataset = get_target_dataset(self.args.dataset, train=self.args.split == 'train', transform=transform)
         
     def _setup_prompts(self):
-        self.prompts_df = pd.read_csv(self.args.prompt_path)
-        
-        # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L276
-        text_input = self.tokenizer(self.prompts_df.prompt.tolist(), padding="max_length",
-                               max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
-        embeddings = []
-        with torch.inference_mode():
-            for i in range(0, len(text_input.input_ids), 100):
-                text_embeddings = self.text_encoder(
-                    text_input.input_ids[i: i + 100].to(self.device),
-                )[0]
-                embeddings.append(text_embeddings)
-        self.text_embeddings = torch.cat(embeddings, dim=0)
-        assert len(self.text_embeddings) == len(self.prompts_df)
+        if self.args.template_path is not None:
+            loaded_state_dict = torch.load(self.args.template_path, weights_only=True, map_location=self.device)
+            prompt_learner = PromptLearner(self.tokenizer, self.text_encoder).to(self.device)
+            prompt_learner.load_state_dict(loaded_state_dict)
+            classnames = self.target_dataset.classes
+            with torch.no_grad():
+                self.text_embeddings = prompt_learner.get_prompt_embeds(classnames)
+        else: 
+            self.prompts_df = pd.read_csv(self.args.prompt_path)
+            
+            # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L276
+            text_input = self.tokenizer(self.prompts_df.prompt.tolist(), padding="max_length",
+                                max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
+            embeddings = []
+            with torch.inference_mode():
+                for i in range(0, len(text_input.input_ids), 100):
+                    text_embeddings = self.text_encoder(
+                        text_input.input_ids[i: i + 100].to(self.device),
+                    )[0]
+                    embeddings.append(text_embeddings)
+            self.text_embeddings = torch.cat(embeddings, dim=0)
+            assert len(self.text_embeddings) == len(self.prompts_df)
         
     def _setup_noise(self):
         # load noise
@@ -162,42 +168,6 @@ class DiffusionEvaluator:
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
-    def _setup_learned_templates(self):
-        """Setup learned templates if template_path is provided"""
-        if self.args.template_path is not None:
-            print(f'Loading learned templates from {self.args.template_path}')
-            
-            # Load the saved template checkpoint
-            checkpoint = torch.load(self.args.template_path, map_location=self.device)
-            
-            # Extract template config and class names
-            template_config = checkpoint['template_config']
-            class_names = checkpoint['class_names']
-            
-            # Initialize template learner
-            self.template_learner = TemplateLearner(template_config, class_names).to(self.device)
-            
-            # Load the saved state
-            self.template_learner.load_state_dict(checkpoint['template_learner_state_dict'])
-            self.template_learner.eval()
-            
-            # Generate new text embeddings using learned templates
-            with torch.no_grad():
-                template_embeddings = self.template_learner.template_encoder(class_names)
-                # template_embeddings shape: [num_templates, num_classes, seq_len, embed_dim]
-                
-                # For now, use the first template (you could also implement template selection)
-                # or average across templates
-                self.learned_text_embeddings = template_embeddings[0]  # [num_classes, seq_len, embed_dim]
-                
-                # If you want to average across all templates:
-                # self.learned_text_embeddings = template_embeddings.mean(dim=0)  # [num_classes, seq_len, embed_dim]
-            
-            print(f'Loaded {template_config.num_templates} learned templates')
-            self.use_learned_templates = True
-        else:
-            self.use_learned_templates = False
-    
     def _setup_class_names(self):
         """Setup class name mapping"""
         if hasattr(self.target_dataset, 'classes'):
@@ -366,8 +336,6 @@ class DiffusionEvaluator:
             f.write(f"Loss function: {self.args.loss}\n")
             f.write(f"Data type: {self.args.dtype}\n")
             f.write(f"Interpolation: {self.args.interpolation}\n")
-            if self.args.template_path:
-                f.write(f"Using learned templates: {self.args.template_path}\n")
             f.write(f"Adaptive sampling - n_samples: {self.args.n_samples}\n")
             f.write(f"Adaptive sampling - to_keep: {self.args.to_keep}\n\n")
             
@@ -426,24 +394,15 @@ class DiffusionEvaluator:
                     img_input = img_input.half()
                 x0 = self.vae.encode(img_input).latent_dist.mean
                 x0 *= 0.18215
-            
-            # Use learned templates if available, otherwise use original prompts
-            if self.use_learned_templates:
-                text_embeddings_to_use = self.learned_text_embeddings
-            else:
-                text_embeddings_to_use = self.text_embeddings
+
+            text_embeddings_to_use = self.text_embeddings
                 
             _,pred_idx, pred_errors = self.eval_prob_adaptive(
                 self.unet, x0, text_embeddings_to_use, self.scheduler, 
                 self.args, self.latent_size, self.all_noise
             )
             
-            if self.use_learned_templates:
-                # pred_idx directly corresponds to class index
-                pred = pred_idx
-            else:
-                # Use original logic with prompts_df
-                pred = self.prompts_df.classidx[pred_idx]
+            pred = self.prompts_df.classidx[pred_idx]
                 
             torch.save(dict(errors=pred_errors, pred=pred, label=label), fname)
             if pred == label:
@@ -485,7 +444,7 @@ def main():
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
     parser.add_argument('--loss', type=str, default='l2', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
-    parser.add_argument('--template_path', type=str, default=None, help='Path to trained templates')
+    parser.add_argument('--template_path', type=str, default=None, help='Path to learned templates to use')
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', type=int, required=True)

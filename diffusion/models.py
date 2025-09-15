@@ -13,6 +13,13 @@ MODEL_IDS = {
 }
 
 
+import tempfile
+import torch
+from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
+
+import torch
+from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
+
 def get_sd_model(args):
     if args.dtype == 'float32':
         dtype = torch.float32
@@ -23,14 +30,24 @@ def get_sd_model(args):
 
     assert args.version in MODEL_IDS.keys()
     model_id = MODEL_IDS[args.version]
-    scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
-    pipe = StableDiffusionPipeline.from_pretrained(model_id, scheduler=scheduler, torch_dtype=dtype)
+
+    # use your datasets folder as cache dir
+    custom_cache = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/SD"
+
+    scheduler = EulerDiscreteScheduler.from_pretrained(
+        model_id, subfolder="scheduler", cache_dir=custom_cache
+    )
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model_id, scheduler=scheduler, torch_dtype=dtype, cache_dir=custom_cache
+    )
     pipe.enable_xformers_memory_efficient_attention()
+
     vae = pipe.vae
     tokenizer = pipe.tokenizer
     text_encoder = pipe.text_encoder
     unet = pipe.unet
     return vae, tokenizer, text_encoder, unet, scheduler
+
 
 
 def get_scheduler_config(args):

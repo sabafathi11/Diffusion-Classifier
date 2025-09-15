@@ -15,12 +15,12 @@ from collections import defaultdict
 from learnable_templates import TemplateLearner, TemplateConfig, TemplateTextEncoder
 from diffusers import StableDiffusionXLImg2ImgPipeline
 from daam import trace, set_seed
+import seaborn as sns
 
 # Additional imports for analysis functions
 import matplotlib.pyplot as plt
-import seaborn as sns
+import matplotlib.patches as mpatches
 from sklearn.metrics import confusion_matrix, classification_report
-import cv2
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -111,12 +111,18 @@ class DiffusionEvaluator:
         self.text_encoder = self.text_encoder.to(self.device)
         self.unet = self.unet.to(self.device)
         torch.backends.cudnn.benchmark = True
+
+        # put cache in your datasets folder
+        custom_cache = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/SD"
+
         self.daam_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
             'stabilityai/stable-diffusion-xl-base-1.0',
             torch_dtype=torch.float16,
             use_safetensors=True,
             variant='fp16',
+            cache_dir=custom_cache,
         ).to(self.device)
+
         
     def _setup_dataset(self):
         # set up dataset
@@ -239,7 +245,7 @@ class DiffusionEvaluator:
         
         return masked_hm
 
-    def visualize_mask_on_image(self, image, heat_map, out, mask, save_path=None):
+    def visualize_mask_on_image(self, image, heat_map, out, save_path=None):
 
         # Convert image to numpy array
         if isinstance(image, torch.Tensor):
@@ -250,13 +256,8 @@ class DiffusionEvaluator:
         else:
             image_np = np.array(image) / 255.0
         
-        # Convert mask to numpy and resize to match image dimensions
-        mask_np = mask.cpu().numpy()
-        if mask_np.shape != image_np.shape[:2]:
-            mask_np = cv2.resize(mask_np, (image_np.shape[1], image_np.shape[0]))
-        
         # Create visualization
-        fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
         
         # Original image
         axes[0].imshow(image_np)
@@ -267,11 +268,6 @@ class DiffusionEvaluator:
         axes[1].set_title('Heatmap Overlay')
         axes[1].axis('off')
         
-        # Overlay visualization
-        axes[2].imshow(image_np)
-        axes[2].imshow(mask_np, alpha=0.5)
-        axes[2].set_title('Mask Overlay')
-        axes[2].axis('off')
         
         plt.tight_layout()
         if save_path:
@@ -282,7 +278,8 @@ class DiffusionEvaluator:
             image_pil = torch_transforms.ToPILImage()(image * 0.5 + 0.5)
         else:
             image_pil = image
-        prompt = ' '.join(class_names)
+        #prompt = ' '.join(class_names)
+        prompt = f'a photo of a {class_name}, a type of food'
 
         gen = set_seed(0)
         with torch.no_grad():
@@ -290,34 +287,32 @@ class DiffusionEvaluator:
                 out = self.daam_pipe(
                     prompt=prompt,
                     image=image_pil,
-                    strength=0.2,
-                    num_inference_steps=150,
+                    strength=0.01,
+                    num_inference_steps=100,
                     generator=gen
                 )
 
                 heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
                 hm = heat_map.heatmap  # already a torch.Tensor on GPU
-                threshold = torch.tensor(
-                    np.percentile(hm.cpu().numpy(), 75)  # move to CPU first
-                ).to(hm.device)
-                hm = torch.where(hm >= threshold, hm, torch.zeros_like(hm))
-                for i in hm:
-                    print(i)
+                # threshold = torch.tensor(
+                #     np.percentile(hm.cpu().numpy(), 75)  # move to CPU first
+                # ).to(hm.device)
+                # hm = torch.where(hm >= threshold, hm, torch.zeros_like(hm))
 
                 # attended_pixels = self.gaussian_center_mask_torch(hm, sigma=0.4, threshold=0.15)
-                
-        # Add visualization here
-        print(f"Visualizing attention mask for class {true_class} with label {class_name}")
-        print()
-        os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
-        self.visualize_mask_on_image(
-            image=image,
-            heat_map=heat_map,
-            out=out,
-            mask=hm,
-            save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
-        )
-        print()
+
+
+        # print(f"Visualizing attention mask for class {true_class} with label {class_name}")
+        # print()
+        # os.makedirs(osp.join(self.run_folder, true_class), exist_ok=True)
+        # self.visualize_mask_on_image(
+        #     image=image,
+        #     heat_map=heat_map,
+        #     out=out,
+        #     save_path=f"{true_class}/{class_name}.png"  # Optional: save visualization
+        # )
+        # print()
+
         return hm
     
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, class_names, class_name,
@@ -337,14 +332,76 @@ class DiffusionEvaluator:
         remaining_prmpt_idxs = list(range(len(text_embeds)))
         start = T // max_n_samples // 2
         t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
+        attended_masks = [self.compute_attended_pixels(image, class_names, class_names[i], true_class=class_name)
+                              for i in range(len(class_names))]
+        
+        attended_masks = torch.stack(attended_masks, dim=0)
+        # for i,mask in enumerate(attended_masks):
+        #     image = torch.tensor(image).to(device=latent.device)
+        #     mask = torch.tensor(mask).to(device=latent.device)
+        #     image = image
+        #     image = (image - image.min()) / (image.max() - image.min() + 1e-8)
+        #     # Compute stride/kernel size so that output is 64x64
+        #     # 512 -> 64 means factor of 8
+        #     downsampled_image = F.avg_pool2d(image, kernel_size=8, stride=8)  # shape (1, 3, 64, 64)
 
+        #     # Match mask dimensions -> (1, 1, 64, 64)
+        #     mask = mask.unsqueeze(0).unsqueeze(0)
+
+        #     # Broadcast mask to all channels -> (1, 3, 64, 64)
+        #     mask = mask.expand(-1, 3, -1, -1)
+
+        #     # Multiply
+        #     masked_image = downsampled_image * mask  # (1, 3, 64, 64)
+
+        #     # Remove batch dim if you want -> (3, 64, 64)
+        #     masked_image = masked_image.squeeze(0)
+        #     masked_image = masked_image.cpu()
+        #     plt.imshow(masked_image.permute(1, 2, 0))
+        #     plt.axis('off')
+        #     plt.title(f'image of {class_name} with label {class_names[i]}')
+        #     plt.savefig(osp.join(self.run_folder, f"{class_names[i]}_edited.png"), dpi=300, bbox_inches='tight')
+
+        # heatmap1 = attended_masks.cpu().numpy()
+        # with open('heatmap_data.txt', 'w') as f:
+        #     # Write array shape information
+        #     f.write(f"Array shape: {heatmap1.shape}\n")
+        #     f.write("Heatmap data:\n")
+            
+        #     for label in range(len(class_names)):
+        #         f.write(f"Label {label} ({class_names[label]}):\n")
+        #         # Write the 2D array data
+        #         for i in range(heatmap1.shape[1]):  # Loop through first dimension
+        #             for j in range(heatmap1.shape[2]):  # Loop through second dimension
+        #                 f.write(f"{heatmap1[label, i, j]:.6f} ")
+        #             f.write("\n")  # New line after each row
+        #         f.write("\n\n\n")  # Extra new line after each label
+
+        #     print("Heatmap data saved to 'heatmap_data.txt'")
+        # class_map = np.argmax(heatmap1, axis=0)
+        # colors = plt.cm.get_cmap('tab10', 10)
+        # segmentation = colors(class_map)
+        # label_colors = [colors(i) for i in range(10)]
+        # patches = [
+        #     mpatches.Patch(color=label_colors[i], label=f'Class {class_names[i]}')
+        #     for i in range(10)
+        # ]
+        # fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        # axes[0].imshow(image.permute(1, 2, 0))
+        # axes[0].set_title('Original Image')
+        # axes[0].axis('off')
+        # axes[1].imshow(segmentation)
+        # axes[1].set_title('Segmentation Overlay')
+        # axes[1].axis('off')
+        # axes[1].legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left')
+
+        # plt.tight_layout()
+        # plt.savefig(osp.join(self.run_folder, f"{class_name}_segmentation.png"), dpi=300, bbox_inches='tight')
+        # plt.close()
         for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
             ts = []
             noise_idxs = []
             text_embed_idxs = []
-            attended_masks = [self.compute_attended_pixels(image, class_names, class_names[i], true_class=class_name)
-                              for i in range(len(class_names))]
-            attended_masks = torch.stack(attended_masks, dim=0)  # [num_prompts, H, W]
             curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
             curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
             for prompt_i in remaining_prmpt_idxs:
@@ -416,7 +473,6 @@ class DiffusionEvaluator:
                 
                 # Apply attended pixels mask if provided
                 if attended_masks is not None:
-                    # attended_mask is [H, W] with values in {0,1}
                     mask = attended_masks[text_embed_idxs[idx: idx + batch_size]].float().unsqueeze(1)  # [B, 1, H, W]
                     # Expand to match error dimensions [batch_size, 4, 64, 64]
                     mask = mask.expand(-1, 4, -1, -1)

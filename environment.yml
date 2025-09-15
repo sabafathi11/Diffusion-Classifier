@@ -30,6 +30,7 @@ dependencies:
   - pip:
     - git+https://github.com/modestyachts/ImageNetV2_pytorch
     - datasets
+    - daam==0.2.0
     - git+https://github.com/openai/CLIP.git
     - open_clip_torch
 variables:
