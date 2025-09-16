@@ -9,6 +9,7 @@ from torchvision import datasets
 from diffusion.utils import DATASET_ROOT
 from torch.utils.data import DataLoader
 from diffusion.datasets import get_target_dataset
+import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -25,7 +26,7 @@ class TemplatePromptLearner(torch.nn.Module):
     Learn a GLOBAL template embedding that gets concatenated with class name embeddings.
     The template is optimized during training and can be reused across different classes.
     """
-    def __init__(self, tokenizer, text_encoder, n_template_tokens=57, class_max_length=20, template_init=None, device=None):
+    def __init__(self, tokenizer, text_encoder, n_template_tokens, class_max_length, template_init=None, device=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
@@ -208,12 +209,36 @@ def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     ])
     return transform
 
+def save_checkpoint(epoch, template_learner, optimizer, loss, checkpoint_dir):
+    """Save training checkpoint"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint = {
+        'epoch': epoch,
+        'template_learner_state_dict': template_learner.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Saved checkpoint for epoch {epoch} to {checkpoint_path}")
+
+def load_checkpoint(checkpoint_path, template_learner, optimizer):
+    """Load training checkpoint"""
+    checkpoint = torch.load(checkpoint_path)
+    template_learner.load_state_dict(checkpoint['template_learner_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch'] + 1
+    loss = checkpoint['loss']
+    print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, resuming from epoch {start_epoch}")
+    return start_epoch, loss
+
 def run(args):
 
     transform = get_transform()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dataset = datasets.CIFAR10(root=DATASET_ROOT, train=(args.split == 'train'), download=True, transform=transform)
     classnames = dataset.classes
+    print(classnames)
     #dataset = get_target_dataset(args.dataset, train=args.split == 'train', transform=transform)
     vae, tokenizer, text_encoder, unet, scheduler = get_sd_model(args)
 
@@ -242,15 +267,29 @@ def run(args):
     # Optimizer only updates the global template
     optimizer = torch.optim.AdamW([template_learner.global_template], lr=1e-3)
 
+    # Check for existing checkpoints and resume if requested
+    checkpoint_dir = os.path.join(DATASET_ROOT, 'checkpoints')
+    start_epoch = 0
+    if args.resume:
+        checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
+        if checkpoint_files:
+            # Find the latest checkpoint
+            epochs = [int(f.split('_')[2].split('.')[0]) for f in checkpoint_files]
+            latest_epoch = max(epochs)
+            latest_checkpoint = os.path.join(checkpoint_dir, f'checkpoint_epoch_{latest_epoch}.pt')
+            start_epoch, _ = load_checkpoint(latest_checkpoint, template_learner, optimizer)
+
     train_loader = DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=32,
         shuffle=True,
         pin_memory=True
     )
 
-    for epoch in range(10):
+    for epoch in range(start_epoch, 10):
         print(f"Epoch {epoch + 1}/10")
+        epoch_losses = []
+        
         for batch_idx, (images_batch, labels_batch) in enumerate(train_loader):
             if args.dtype == 'float16':
                 images_batch = images_batch.to(device).half()
@@ -267,8 +306,16 @@ def run(args):
                 classnames, optimizer, device
             )
             
+            epoch_losses.append(loss_val)
+            
             if batch_idx % 10 == 0:
                 print(f"Batch {batch_idx}, train loss: {loss_val}")
+        
+        # Calculate average epoch loss
+        avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+        
+        # Save checkpoint after each epoch
+        save_checkpoint(epoch, template_learner, optimizer, avg_epoch_loss, checkpoint_dir)
         
         # Print template stats for monitoring
         if epoch % 2 == 0:
@@ -276,6 +323,7 @@ def run(args):
             print(f"Template norm: {template.norm().item():.4f}, mean: {template.mean().item():.4f}")
     
     save_path = "templates/global_template_learner.pt"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
     template_learner.save(save_path)
     print(f"Saved learned global template to {save_path}")
 
@@ -295,6 +343,7 @@ def main():
                         choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
                                  'objectnet', 'aircraft'], help='Dataset to use')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
+    parser.add_argument('--resume', action='store_true', help='Resume training from the latest checkpoint')
 
     args = parser.parse_args()
     run(args)

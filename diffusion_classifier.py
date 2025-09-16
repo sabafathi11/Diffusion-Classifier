@@ -15,7 +15,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
-from learnable_templates import PromptLearner
+from learnable_templates import TemplatePromptLearner
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -115,12 +115,20 @@ class DiffusionEvaluator:
         
     def _setup_prompts(self):
         if self.args.template_path is not None:
-            loaded_state_dict = torch.load(self.args.template_path, weights_only=True, map_location=self.device)
-            prompt_learner = PromptLearner(self.tokenizer, self.text_encoder).to(self.device)
-            prompt_learner.load_state_dict(loaded_state_dict)
-            classnames = self.target_dataset.classes
-            with torch.no_grad():
-                self.text_embeddings = prompt_learner.get_prompt_embeds(classnames)
+            # Load the saved TemplatePromptLearner
+            template_learner = TemplatePromptLearner(
+                tokenizer=self.tokenizer,
+                text_encoder=self.text_encoder,
+                n_template_tokens=32,  # Match the saved template dimensions
+                class_max_length=45,   # Match the saved template dimensions
+                device=self.device
+            ).to(self.device)
+            # Load the saved state
+            template_learner.load(self.args.template_path, map_location=self.device)
+            template_learner.eval()
+            # Generate embeddings using the learned template
+            with torch.inference_mode():
+                self.text_embeddings = template_learner.get_prompt_embeds(self.classnames)
         else: 
             self.prompts_df = pd.read_csv(self.args.prompt_path)
             
@@ -179,6 +187,7 @@ class DiffusionEvaluator:
             if 'class_name' in self.prompts_df.columns:
                 for _, row in self.prompts_df.iterrows():
                     self.classidx_to_name[row['classidx']] = row['class_name']
+        self.classnames = [self.classidx_to_name.get(i, str(i)) for i in range(len(self.classidx_to_name))]
     
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
         scheduler_config = get_scheduler_config(args)
