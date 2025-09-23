@@ -12,14 +12,6 @@ MODEL_IDS = {
     '2-1': "stabilityai/stable-diffusion-2-1-base"
 }
 
-
-import tempfile
-import torch
-from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
-
-import torch
-from diffusers import StableDiffusionPipeline, EulerDiscreteScheduler
-
 def get_sd_model(args):
     if args.dtype == 'float32':
         dtype = torch.float32
@@ -40,7 +32,7 @@ def get_sd_model(args):
     pipe = StableDiffusionPipeline.from_pretrained(
         model_id, scheduler=scheduler, torch_dtype=dtype, cache_dir=custom_cache
     )
-    pipe.enable_xformers_memory_efficient_attention()
+    #pipe.enable_xformers_memory_efficient_attention()
 
     vae = pipe.vae
     tokenizer = pipe.tokenizer

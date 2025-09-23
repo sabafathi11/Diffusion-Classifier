@@ -1,196 +1,154 @@
-from diffusers import StableDiffusionXLImg2ImgPipeline
-from PIL import Image
 import torch
-from daam import trace, set_seed
-from matplotlib import pyplot as plt
-import numpy as np
-from diffusion.datasets import get_target_dataset
-import torchvision.transforms as torch_transforms
-from torchvision.transforms.functional import InterpolationMode
-from diffusers import DiffusionPipeline
-from torchvision.transforms.functional import to_pil_image
-import os.path as osp
-import os
-import itertools
+import torch.nn as nn
+from diffusers import  StableDiffusionPipeline, EulerDiscreteScheduler
 
 
-INTERPOLATIONS = {
-    'bilinear': InterpolationMode.BILINEAR,
-    'bicubic': InterpolationMode.BICUBIC,
-    'lanczos': InterpolationMode.LANCZOS,
-}
+class PromptLearner(nn.Module):
+    def __init__(self, class_names, tokenizer, text_encoder, n_ctx=16, ctx_init=None, class_token_position="end", dtype=torch.float16):
+        super().__init__()
+        
+        self.n_cls = len(class_names)
+        self.class_names = class_names
+        self.n_ctx = n_ctx
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+        self.class_token_position = class_token_position
+        
+        # Get text encoder embedding dimension from the actual model
+        self.ctx_dim = self.text_encoder.get_input_embeddings().embedding_dim
+        
 
-def _convert_image_to_rgb(image):
-    return image.convert("RGB")
+        if ctx_init:
+            # use given words to initialize context vectors
+            n_ctx = len(ctx_init.split(" "))
+            prompt_tokens = self.tokenizer(ctx_init, add_special_tokens=False, return_tensors="pt")
+            with torch.no_grad():
+                input_ids = prompt_tokens.input_ids.to(self.text_encoder.device)
+                init_embeddings = self.text_encoder.get_input_embeddings()(input_ids).type(dtype)
 
-def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
-    transform = torch_transforms.Compose([
-        torch_transforms.Resize(size, interpolation=interpolation),
-        torch_transforms.CenterCrop(size),
-        _convert_image_to_rgb,
-        torch_transforms.ToTensor(),
-        torch_transforms.Normalize([0.5], [0.5])
-    ])
-    return transform
+            ctx_vectors = init_embeddings[0, 1 : 1 + n_ctx, :]
+            prompt_prefix = ctx_init
 
+        else:
+            print("Initializing a generic context")
+            ctx_vectors = torch.empty(self.n_ctx, self.ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
 
-def run_experiment(pipe, image_pil, prompt, classes, hyperparams, output_dir, img_idx, label):
-    """Run experiment with given hyperparameters"""
-    num_steps, strength, threshold_percentile = hyperparams
-    
-    # Create specific directory for this hyperparameter combination
-    param_dir = f"steps_{num_steps}_strength_{strength:.3f}_thresh_{threshold_percentile}"
-    full_output_dir = osp.join(output_dir, label, param_dir)
-    os.makedirs(full_output_dir, exist_ok=True)
-    
-    gen = set_seed(0)  # Fixed seed for reproducibility
-    
-    for class_name in classes:
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+
+        name_lens = [self.tokenizer(name, return_tensors="pt").input_ids.shape[1] for name in self.class_names]
+        prompts = [prompt_prefix + " " + name + "." for name in self.class_names]
+
+        tokenized_prompts = torch.cat([self.tokenizer(p, return_tensors="pt").input_ids for p in prompts]).to(self.text_encoder.device)
         with torch.no_grad():
-            with trace(pipe) as tc:
-                out = pipe(
-                    prompt=prompt,
-                    image=image_pil,
-                    strength=strength,
-                    num_inference_steps=num_steps,
-                    generator=gen
+            embedding = self.text_encoder.get_input_embeddings()(tokenized_prompts).type(dtype)
+
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+
+
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.name_lens = name_lens
+        self.class_token_position = class_token_position
+
+    def forward(self):
+        ctx = self.ctx
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+
+        if self.class_token_position == "end":
+            prompts = torch.cat(
+                [
+                    prefix,  # (n_cls, 1, dim)
+                    ctx,     # (n_cls, n_ctx, dim)
+                    suffix,  # (n_cls, *, dim)
+                ],
+                dim=1,
+            )
+
+        elif self.class_token_position == "middle":
+            half_n_ctx = self.n_ctx // 2
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                prefix_i = prefix[i : i + 1, :, :]
+                class_i = suffix[i : i + 1, :name_len, :]
+                suffix_i = suffix[i : i + 1, name_len:, :]
+                ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
+                ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
+                prompt = torch.cat(
+                    [
+                        prefix_i,     # (1, 1, dim)
+                        ctx_i_half1,  # (1, n_ctx//2, dim)
+                        class_i,      # (1, name_len, dim)
+                        ctx_i_half2,  # (1, n_ctx//2, dim)
+                        suffix_i,     # (1, *, dim)
+                    ],
+                    dim=1,
                 )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)
 
-                heat_map = tc.compute_global_heat_map().compute_word_heat_map(class_name)
-                hm = np.array(heat_map.heatmap.cpu())
-                threshold = np.percentile(hm, threshold_percentile)
-                mask = np.zeros_like(hm)
-                mask[hm > threshold] = hm[hm > threshold]
+        elif self.class_token_position == "front":
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                prefix_i = prefix[i : i + 1, :, :]
+                class_i = suffix[i : i + 1, :name_len, :]
+                suffix_i = suffix[i : i + 1, name_len:, :]
+                ctx_i = ctx[i : i + 1, :, :]
+                prompt = torch.cat(
+                    [
+                        prefix_i,  # (1, 1, dim)
+                        class_i,   # (1, name_len, dim)
+                        ctx_i,     # (1, n_ctx, dim)
+                        suffix_i,  # (1, *, dim)
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)
 
-                fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-                
-                # Original image
-                axes[0].imshow(image_pil)
-                axes[0].set_title('Original Image')
-                axes[0].axis('off')
+        else:
+            raise ValueError
 
-                # Heatmap overlay
-                heat_map.plot_overlay(out.images[0], ax=axes[1])
-                axes[1].set_title(f'Heatmap Overlay - {class_name}')
-                axes[1].axis('off')
-                
-                # Mask overlay
-                axes[2].imshow(image_pil)
-                axes[2].imshow(mask, alpha=0.5, cmap='hot')
-                axes[2].set_title(f'Mask Overlay - Thresh: {threshold_percentile}%')
-                axes[2].axis('off')
+        position_ids = torch.arange(prompts.size(1), device=prompts.device).unsqueeze(0)
+        position_embeddings = self.text_encoder.text_model.embeddings.position_embedding(position_ids)
+        hidden_states = prompts + position_embeddings
+        mask = torch.ones(prompts.size(0), 1, prompts.size(1), prompts.size(1), device=prompts.device).type(hidden_states.dtype)
 
-                # Add hyperparameters as title
-                fig.suptitle(f'Steps: {num_steps}, Strength: {strength}, Threshold: {threshold_percentile}%, Image: {img_idx}')
-                
-                # Save with detailed filename
-                filename = f'heat_map_{class_name}_img{img_idx}_steps{num_steps}_str{strength:.3f}_thr{threshold_percentile}.png'
-                plt.savefig(osp.join(full_output_dir, filename), bbox_inches='tight', dpi=150)
-                plt.close()
+        encoder_outputs = self.text_encoder.text_model.encoder(
+            hidden_states,
+            attention_mask=mask,
+            output_hidden_states=False,
+        )
 
-def main():
-    # Setup
-    interpolation = INTERPOLATIONS['bicubic']
-    transform = get_transform(interpolation, 512)
-    dataset = get_target_dataset('cifar10', 'test', transform=transform)
-    
-    rand_idx = np.random.choice(np.arange(0, len(dataset)), size=5, replace=False)
-    model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
-    device = 'cuda'
-    
-    # Load model once
-    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        use_safetensors=True,
-        variant='fp16',
-    ).to(device)
-    
-    class_names = dataset.classes
-    prompt = ' '.join(class_names)
-    
-    # Hyperparameter configurations
-    HYPERPARAMS = {
-        'num_inference_steps': [50, 100],
-        'strength': [0.01, 0.03, 0.1],
-        'threshold_percentile': [70, 90, 95]
-    }
-    # Create all combinations of hyperparameters
-    param_combinations = list(itertools.product(
-        HYPERPARAMS['num_inference_steps'],
-        HYPERPARAMS['strength'], 
-        HYPERPARAMS['threshold_percentile']
-    ))
-    
-    print(f"Testing {len(param_combinations)} hyperparameter combinations on {len(rand_idx)} images")
-    
-    # Main experiment loop
-    for i in rand_idx:
-        img, label = dataset[i]
-        label = class_names[label]
-        print(f"\nProcessing Image Index: {i}, Label: {label}, Image shape: {img.shape}")
-        image_pil = to_pil_image(img)
-        
-        for param_idx, params in enumerate(param_combinations):
-            print(f"  Running combination {param_idx + 1}/{len(param_combinations)}: "
-                  f"steps={params[0]}, strength={params[1]}, threshold={params[2]}%")
-            
-            run_experiment(
-                pipe, image_pil, prompt, class_names, params, 
-                'daam_hyperparameter', i, label
-            )
-    
-    print("\nHyperparameter sweep completed!")
-    print(f"Results saved in 'daam_hyperparameter' directory")
+        last_hidden_state = self.text_encoder.text_model.final_layer_norm(encoder_outputs[0])
 
-if __name__ == "__main__":
-    main()
+        return last_hidden_state
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dtype = torch.float16
+custom_cache = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/SD"
+scheduler = EulerDiscreteScheduler.from_pretrained("stabilityai/stable-diffusion-2-base", subfolder="scheduler", cache_dir=custom_cache)
+pipe = StableDiffusionPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-2-base", scheduler=scheduler, torch_dtype=dtype, cache_dir=custom_cache
+)
 
-# Alternative: Run specific hyperparameter combinations
-def run_custom_params():
-    """
-    Alternative function to test specific hyperparameter combinations
-    Modify the custom_params list below to test specific combinations
-    """
-    # Define custom parameter combinations
-    custom_params = [
-        (20, 0.01, 80),   # (num_steps, strength, threshold_percentile)
-        (50, 0.03, 80),
-        (100, 0.05, 90),
-        # Add more combinations as needed
-    ]
-    
-    # Setup (same as main)
-    interpolation = INTERPOLATIONS['bicubic']
-    transform = get_transform(interpolation, 512)
-    dataset = get_target_dataset('cifar10', 'test', transform=transform)
-    
-    rand_idx = np.random.choice(np.arange(0, len(dataset)), size=2, replace=False)  # Fewer images for testing
-    model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
-    device = 'cuda'
-    
-    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        use_safetensors=True,
-        variant='fp16',
-    ).to(device)
-    
-    prompt = "bird horse cat deer frog dog truck airplane automobile ship"
-    classes = prompt.split()
-    
-    for i in rand_idx:
-        img, label = dataset[i]
-        print(f"\nProcessing Image Index: {i}, Label: {label}")
-        image_pil = to_pil_image(img)
-        
-        for params in custom_params:
-            print(f"  Testing: steps={params[0]}, strength={params[1]}, threshold={params[2]}%")
-            run_experiment(
-                pipe, image_pil, prompt, classes, params,
-                'daam_custom_params', i, label
-            )
+vae = pipe.vae.to(device)
+tokenizer = pipe.tokenizer
+text_encoder = pipe.text_encoder.to(device)
+unet = pipe.unet.to(device)
+torch.backends.cudnn.benchmark = True
 
-# Uncomment the line below to run custom parameters instead of full sweep
-# run_custom_params()
+prompt_learner = PromptLearner(['a','b','c'], tokenizer, text_encoder, 16, 'a photo of a', 'end').to(device)
+
+x = prompt_learner()
+print(x.shape)

@@ -1,203 +1,38 @@
 import argparse
-import numpy as np
+import os
+import os.path as osp
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from diffusion.models import get_sd_model
+import torch.optim as optim
+import tqdm
+from diffusion.datasets import get_target_dataset
+from diffusion.models import get_sd_model, get_scheduler_config
+from diffusion.utils import DATASET_ROOT
 import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
-from torchvision import datasets
-from diffusion.utils import DATASET_ROOT
-from torch.utils.data import DataLoader
-from diffusion.datasets import get_target_dataset
-import os
+
+"""
+batch_size = 32-128
+epoch_size = 50-200
+n_ctx = 16
+ctx_init = "a blurry photo of a"
+timestep = 50
+"""
+
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-seed = 42
+INTERPOLATIONS = {
+    'bilinear': InterpolationMode.BILINEAR,
+    'bicubic': InterpolationMode.BICUBIC,
+    'lanczos': InterpolationMode.LANCZOS,
+}
 
-torch.manual_seed(seed)             # sets seed for CPU
-torch.cuda.manual_seed(seed)        # sets seed for current GPU
-torch.cuda.manual_seed_all(seed)    # sets seed for all GPUs (if you use multi-GPU)
-np.random.seed(seed) 
-
-
-class TemplatePromptLearner(torch.nn.Module):
-    """
-    Learn a GLOBAL template embedding that gets concatenated with class name embeddings.
-    The template is optimized during training and can be reused across different classes.
-    """
-    def __init__(self, tokenizer, text_encoder, n_template_tokens, class_max_length, template_init=None, device=None):
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.text_encoder = text_encoder
-        self.n_template_tokens = n_template_tokens
-        self.class_max_length = class_max_length
-        self.device = device if device is not None else next(text_encoder.parameters()).device
-        self.hidden_size = text_encoder.config.hidden_size
-        
-        # Ensure total length doesn't exceed CLIP limit
-        assert n_template_tokens + class_max_length <= 77, f"Total length {n_template_tokens + class_max_length} exceeds CLIP limit of 77"
-
-        # learnable global template vectors (initialized randomly or from template_init)
-        if template_init is None:
-            template_init = torch.randn(n_template_tokens, self.hidden_size) * 0.02
-        self.global_template = torch.nn.Parameter(template_init.to(self.device))  # shape [n_template_tokens, D]
-
-        # keep text encoder frozen (we want to update only the global template)
-        for p in self.text_encoder.parameters():
-            p.requires_grad = False
-
-    def get_prompt_embeds(self, classnames, max_length=None):
-        """
-        Create embeddings by concatenating global template + class name embeddings
-        Uses fixed lengths: n_template_tokens + class_max_length = 77 exactly
-        """
-        # Encode class names with controlled length
-        enc = self.tokenizer(
-            classnames,
-            padding="max_length",
-            truncation=True,
-            max_length=self.class_max_length,
-            return_tensors="pt"
-        )
-        input_ids = enc["input_ids"].to(self.device)            # [B, class_max_length]
-        attention_mask = enc["attention_mask"].to(self.device)  # [B, class_max_length]
-
-        # Get class name embeddings through the text encoder
-        with torch.no_grad():
-            class_outputs = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-            class_embeds = class_outputs.last_hidden_state  # [B, class_max_length, D]
-        
-        B, L, D = class_embeds.shape
-        assert L == self.class_max_length
-        assert D == self.hidden_size
-
-        # Expand global template for batch
-        template_expand = self.global_template.unsqueeze(0).expand(B, -1, -1)  # [B, n_template_tokens, D]
-        template_expand = template_expand.to(class_embeds.dtype)
-        
-        # Concatenate global template + class embeddings
-        # This will be exactly n_template_tokens + class_max_length = 77 tokens
-        combined_embeds = torch.cat([template_expand, class_embeds], dim=1)  # [B, 77, D]
-        
-        # Create attention mask for combined embeddings
-        template_mask = torch.ones((B, self.n_template_tokens), device=self.device, dtype=attention_mask.dtype)
-        combined_attention_mask = torch.cat([template_mask, attention_mask], dim=1)  # [B, 77]
-
-        # Process through text encoder transformer layers manually to get final representations
-        # We need to bypass the embedding layer since we already have embeddings
-        
-        # Get position embeddings for full sequence
-        seq_length = combined_embeds.shape[1]  # Should be 77
-        position_ids = torch.arange(seq_length, dtype=torch.long, device=self.device).unsqueeze(0).expand(B, -1)
-        position_embeds = self.text_encoder.text_model.embeddings.position_embedding(position_ids)
-        
-        # Add position embeddings
-        embeddings = combined_embeds + position_embeds
-        
-        # Create extended attention mask for encoder
-        extended_attention_mask = combined_attention_mask[:, None, None, :]
-        extended_attention_mask = extended_attention_mask.to(dtype=embeddings.dtype)
-        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        
-        # Pass through the encoder
-        encoder_outputs = self.text_encoder.text_model.encoder(
-            inputs_embeds=embeddings,
-            attention_mask=extended_attention_mask
-        )
-        
-        hidden_states = encoder_outputs.last_hidden_state
-        
-        # Apply final layer norm
-        hidden_states = self.text_encoder.text_model.final_layer_norm(hidden_states)
-        
-        return hidden_states
-    
-    def get_global_template(self):
-        """Return the learned global template for inspection or reuse"""
-        return self.global_template.detach()
-    
-    def save(self, path: str):
-        """Save the learned global template."""
-        torch.save(self.state_dict(), path)
-
-    def load(self, path: str, map_location=None):
-        """Load the learned global template."""
-        state = torch.load(path, map_location=map_location)
-        self.load_state_dict(state)
-
-def prompt_training_step(template_learner,
-                         unet,
-                         scheduler,
-                         latents,      # [B, 4, H, W] (already on device)
-                         labels,       # [B] (long tensor, values in [0..C-1])
-                         classnames,   # list[str] length C
-                         optimizer,
-                         device,
-                         loss_kind='l2'):
-    """
-    MEMORY-OPTIMIZED version:
-    Instead of expanding batch to B*C, process each class separately to save memory
-    """
-    template_learner.train()
-    unet.eval()   # unet frozen in eval mode (no dropout etc). ensure params require_grad=False
-    for p in unet.parameters():
-        p.requires_grad = False
-
-    B = latents.shape[0]
-    C = len(classnames)
-
-    # 1) get class prompt embeddings with global template: [C, L, D]
-    prompt_embeds = template_learner.get_prompt_embeds(classnames)  # on device
-
-    # 2) sample noise and timesteps per image
-    T = scheduler.config.num_train_timesteps if hasattr(scheduler.config, "num_train_timesteps") else len(scheduler.alphas_cumprod)
-    timesteps = torch.randint(0, T, (B,), device=device, dtype=torch.long)  # one t per image
-    noise = torch.randn_like(latents, device=device)  # [B, 4, H, W]
-
-    # 3) compute noised latents (vectorized)
-    alphas_cumprod = scheduler.alphas_cumprod.to(device)  # ensure on device
-    a = alphas_cumprod[timesteps].view(B, 1, 1, 1).sqrt()
-    one_minus_a = (1 - alphas_cumprod[timesteps]).view(B, 1, 1, 1).sqrt()
-    noised = latents * a + noise * one_minus_a  # [B, 4, H, W]
-
-    # Memory-optimized approach - process classes one by one
-    losses_per_pair = torch.zeros(B, C, device=device)
-    
-    for c in range(C):
-        # Get prompt embedding for this class
-        pe_c = prompt_embeds[c:c+1].expand(B, -1, -1)  # [B, L, D]
-        
-        # Forward through UNet for this class
-        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(next(unet.parameters()).dtype == torch.float16)):
-            out = unet(noised, timesteps, encoder_hidden_states=pe_c)
-        noise_pred = out.sample  # [B, 4, H, W]
-        
-        # Compute loss for this class
-        if loss_kind == 'l2':
-            errs = F.mse_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2, 3))  # [B]
-        elif loss_kind == 'l1':
-            errs = F.l1_loss(noise_pred, noise, reduction='none').mean(dim=(1, 2, 3))
-        else:
-            raise NotImplementedError
-            
-        losses_per_pair[:, c] = errs
-
-    # 4) logits: lower loss -> higher score, so use negative loss as logits
-    logits = -losses_per_pair  # [B, C]
-
-    # 5) classification loss
-    ce_loss = F.cross_entropy(logits, labels.to(device))
-
-    # 6) step
-    optimizer.zero_grad()
-    ce_loss.backward()
-    optimizer.step()
-
-    return ce_loss.item()
 
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
+
 
 def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     transform = torch_transforms.Compose([
@@ -209,144 +44,411 @@ def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     ])
     return transform
 
-def save_checkpoint(epoch, template_learner, optimizer, loss, checkpoint_dir):
-    """Save training checkpoint"""
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint = {
-        'epoch': epoch,
-        'template_learner_state_dict': template_learner.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }
-    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
-    torch.save(checkpoint, checkpoint_path)
-    print(f"Saved checkpoint for epoch {epoch} to {checkpoint_path}")
-
-def load_checkpoint(checkpoint_path, template_learner, optimizer):
-    """Load training checkpoint"""
-    checkpoint = torch.load(checkpoint_path)
-    template_learner.load_state_dict(checkpoint['template_learner_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    start_epoch = checkpoint['epoch'] + 1
-    loss = checkpoint['loss']
-    print(f"Loaded checkpoint from epoch {checkpoint['epoch']}, resuming from epoch {start_epoch}")
-    return start_epoch, loss
-
-def run(args):
-
-    transform = get_transform()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dataset = datasets.CIFAR10(root=DATASET_ROOT, train=(args.split == 'train'), download=True, transform=transform)
-    classnames = dataset.classes
-    print(classnames)
-    #dataset = get_target_dataset(args.dataset, train=args.split == 'train', transform=transform)
-    vae, tokenizer, text_encoder, unet, scheduler = get_sd_model(args)
-
-    #dtype_map = {'float16': torch.float16, 'float32': torch.float32}
-    #torch_dtype = dtype_map[args.dtype]    
-    
-    vae = vae.to(device)
-    unet = unet.to(device)
-    text_encoder = text_encoder.to(device)
-
-    if args.dtype == 'float16':
-        text_encoder = text_encoder.half()
-        unet = unet.half()
-        vae = vae.half()
-
-    # Use the new TemplatePromptLearner with controlled lengths
-    # Using 32 template tokens + 45 class tokens = 77 total (fits perfectly in CLIP)
-    template_learner = TemplatePromptLearner(
-        tokenizer, 
-        text_encoder, 
-        n_template_tokens=32, 
-        class_max_length=45, 
-        device=device
-    ).to(device)
-    
-    # Optimizer only updates the global template
-    optimizer = torch.optim.AdamW([template_learner.global_template], lr=1e-3)
-
-    # Check for existing checkpoints and resume if requested
-    checkpoint_dir = os.path.join(DATASET_ROOT, 'checkpoints')
-    start_epoch = 0
-    if args.resume:
-        checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_epoch_') and f.endswith('.pt')]
-        if checkpoint_files:
-            # Find the latest checkpoint
-            epochs = [int(f.split('_')[2].split('.')[0]) for f in checkpoint_files]
-            latest_epoch = max(epochs)
-            latest_checkpoint = os.path.join(checkpoint_dir, f'checkpoint_epoch_{latest_epoch}.pt')
-            start_epoch, _ = load_checkpoint(latest_checkpoint, template_learner, optimizer)
-
-    train_loader = DataLoader(
-        dataset,
-        batch_size=32,
-        shuffle=True,
-        pin_memory=True
-    )
-
-    for epoch in range(start_epoch, 10):
-        print(f"Epoch {epoch + 1}/10")
-        epoch_losses = []
+class PromptLearner(nn.Module):
+    def __init__(self, class_names, tokenizer, text_encoder, n_ctx=16, ctx_init=None, class_token_position="end", dtype=torch.float16):
+        super().__init__()
         
-        for batch_idx, (images_batch, labels_batch) in enumerate(train_loader):
-            if args.dtype == 'float16':
-                images_batch = images_batch.to(device).half()
-            else:
-                images_batch = images_batch.to(device).float()
-                
+        self.n_cls = len(class_names)
+        self.class_names = class_names
+        self.n_ctx = n_ctx
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
+        self.class_token_position = class_token_position
+        
+        # Get text encoder embedding dimension from the actual model
+        self.ctx_dim = self.text_encoder.get_input_embeddings().embedding_dim
+        
+
+        if ctx_init:
+            # use given words to initialize context vectors
+            n_ctx = len(ctx_init.split(" "))
+            prompt_tokens = self.tokenizer(ctx_init, add_special_tokens=False, return_tensors="pt")
             with torch.no_grad():
-                latents_batch = vae.encode(images_batch).latent_dist.mean
-                latents_batch *= 0.18215
+                input_ids = prompt_tokens.input_ids.to(self.text_encoder.device)
+                init_embeddings = self.text_encoder.get_input_embeddings()(input_ids).type(dtype)
 
-            loss_val = prompt_training_step(
-                template_learner, unet, scheduler,
-                latents_batch, labels_batch,
-                classnames, optimizer, device
+            ctx_vectors = init_embeddings[0, 1 : 1 + n_ctx, :]
+            prompt_prefix = ctx_init
+
+        else:
+            print("Initializing a generic context")
+            ctx_vectors = torch.empty(self.n_ctx, self.ctx_dim, dtype=dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
+
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens): {n_ctx}")
+
+        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+
+        name_lens = [self.tokenizer(name, return_tensors="pt").input_ids.shape[1] for name in self.class_names]
+        prompts = [prompt_prefix + " " + name + "." for name in self.class_names]
+
+        tokenized_prompts = torch.cat([self.tokenizer(p, return_tensors="pt").input_ids for p in prompts]).to(self.text_encoder.device)
+        with torch.no_grad():
+            embedding = self.text_encoder.get_input_embeddings()(tokenized_prompts).type(dtype)
+
+        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
+
+
+        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
+        self.name_lens = name_lens
+        self.class_token_position = class_token_position
+
+    def forward(self):
+        ctx = self.ctx
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+
+        if self.class_token_position == "end":
+            prompts = torch.cat(
+                [
+                    prefix,  # (n_cls, 1, dim)
+                    ctx,     # (n_cls, n_ctx, dim)
+                    suffix,  # (n_cls, *, dim)
+                ],
+                dim=1,
             )
+
+        elif self.class_token_position == "middle":
+            half_n_ctx = self.n_ctx // 2
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                prefix_i = prefix[i : i + 1, :, :]
+                class_i = suffix[i : i + 1, :name_len, :]
+                suffix_i = suffix[i : i + 1, name_len:, :]
+                ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
+                ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
+                prompt = torch.cat(
+                    [
+                        prefix_i,     # (1, 1, dim)
+                        ctx_i_half1,  # (1, n_ctx//2, dim)
+                        class_i,      # (1, name_len, dim)
+                        ctx_i_half2,  # (1, n_ctx//2, dim)
+                        suffix_i,     # (1, *, dim)
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)
+
+        elif self.class_token_position == "front":
+            prompts = []
+            for i in range(self.n_cls):
+                name_len = self.name_lens[i]
+                prefix_i = prefix[i : i + 1, :, :]
+                class_i = suffix[i : i + 1, :name_len, :]
+                suffix_i = suffix[i : i + 1, name_len:, :]
+                ctx_i = ctx[i : i + 1, :, :]
+                prompt = torch.cat(
+                    [
+                        prefix_i,  # (1, 1, dim)
+                        class_i,   # (1, name_len, dim)
+                        ctx_i,     # (1, n_ctx, dim)
+                        suffix_i,  # (1, *, dim)
+                    ],
+                    dim=1,
+                )
+                prompts.append(prompt)
+            prompts = torch.cat(prompts, dim=0)
+
+        else:
+            raise ValueError
+
+        position_ids = torch.arange(prompts.size(1), device=prompts.device).unsqueeze(0)
+        position_embeddings = self.text_encoder.text_model.embeddings.position_embedding(position_ids)
+        hidden_states = prompts + position_embeddings
+        mask = torch.ones(prompts.size(0), 1, prompts.size(1), prompts.size(1), device=prompts.device).type(hidden_states.dtype)
+
+        encoder_outputs = self.text_encoder.text_model.encoder(
+            hidden_states,
+            attention_mask=mask,
+            output_hidden_states=False,
+        )
+
+        last_hidden_state = self.text_encoder.text_model.final_layer_norm(encoder_outputs[0])
+
+        return last_hidden_state
+
+
+
+def eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
+               text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2'):
+    """
+    Evaluate diffusion prediction error.
+    """
+    assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
+    
+    # Store errors in a list when training to avoid in-place operations
+    pred_errors_list = []
+    
+    idx = 0
+    
+    context_manager = torch.enable_grad()
+    
+    with context_manager:
+        for _ in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
+            batch_ts = torch.tensor(ts[idx: idx + batch_size])
+            noise = all_noise[noise_idxs[idx: idx + batch_size]]
+            noised_latent = latent * (scheduler.alphas_cumprod[batch_ts] ** 0.5).view(-1, 1, 1, 1).to(device) + \
+                            noise * ((1 - scheduler.alphas_cumprod[batch_ts]) ** 0.5).view(-1, 1, 1, 1).to(device)
+            t_input = batch_ts.to(device).half() if dtype == 'float16' else batch_ts.to(device)
+            text_input = text_embeds[text_embed_idxs[idx: idx + batch_size]]
+            noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
             
-            epoch_losses.append(loss_val)
+            if loss == 'l2':
+                error = F.mse_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+            elif loss == 'l1':
+                error = F.l1_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+            elif loss == 'huber':
+                error = F.huber_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+            else:
+                raise NotImplementedError
             
-            if batch_idx % 10 == 0:
-                print(f"Batch {batch_idx}, train loss: {loss_val}")
+            pred_errors_list.append(error)
+
+            idx += len(batch_ts)
+
+    pred_errors = torch.cat(pred_errors_list, dim=0)
+    
+    return pred_errors
+
+
+def eval_prob_adaptive_differentiable(unet, latent, text_embeds, scheduler, args, 
+                                    latent_size=64, all_noise=None):
+    """
+    Differentiable version of eval_prob_adaptive for training.
+    Returns class probabilities based on negative diffusion errors.
+    """
+    scheduler_config = get_scheduler_config(args)
+    T = scheduler_config['num_train_timesteps']
+    n_classes = len(text_embeds)
+    
+    if all_noise is None:
+        all_noise = torch.randn((args.n_trials, 4, latent_size, latent_size), device=latent.device)
+    
+    if args.dtype == 'float16':
+        all_noise = all_noise.half()
+        scheduler.alphas_cumprod = scheduler.alphas_cumprod.half()
+    
+    n_timesteps = 50 
+    timesteps = torch.randint(0, T, (n_timesteps,), device=latent.device)
+
+    class_errors = []
+    
+    for class_idx in range(n_classes):
+        ts = timesteps.repeat(len(all_noise)).tolist()
+        noise_idxs = list(range(len(all_noise))) * len(timesteps)
+        text_embed_idxs = [class_idx] * len(ts)
         
-        # Calculate average epoch loss
-        avg_epoch_loss = sum(epoch_losses) / len(epoch_losses)
+        errors = eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
+                          text_embeds, text_embed_idxs, args.batch_size, args.dtype, 
+                          args.loss)
+        
+        # Average error for this class
+        mean_error = errors.mean()
+        class_errors.append(mean_error)
+    
+    # Stack errors and convert to probabilities (lower error = higher probability)
+    class_errors = torch.stack(class_errors)  # Shape: [n_classes]
+    
+    # Use softmax with temperature to convert errors to probabilities
+    # Negative because lower error should mean higher probability
+    temperature = 0.1
+    probs = F.softmax(-class_errors / temperature, dim=0)
+    return probs, class_errors
+
+
+def save_epoch_checkpoints(prompt_learner, epoch, save_dir, args):
+    """Save learned embeddings and model state dict for the current epoch"""
+    
+    # Create epoch-specific directory
+    epoch_dir = osp.join(save_dir, f'epoch_{epoch:03d}')
+    os.makedirs(epoch_dir, exist_ok=True)
+    
+    # Save prompt learner state dict
+    prompt_state_path = osp.join(epoch_dir, 'prompt_learner.pth')
+    torch.save(prompt_learner.state_dict(), prompt_state_path)
+    
+    # Save the learned embeddings (output of forward pass)
+    with torch.no_grad():
+        learned_embeddings = prompt_learner()
+        embeddings_path = osp.join(epoch_dir, 'learned_embeddings.pth')
+        torch.save(learned_embeddings.cpu(), embeddings_path)
+    
+    # Save the raw context vectors (learnable parameters)
+    ctx_vectors_path = osp.join(epoch_dir, 'context_vectors.pth')
+    torch.save(prompt_learner.ctx.data.cpu(), ctx_vectors_path)
+    
+    # Save metadata about the model
+    metadata = {
+        'epoch': epoch,
+        'n_ctx': args.n_ctx,
+        'ctx_dim': prompt_learner.ctx_dim,
+        'n_classes': prompt_learner.n_cls,
+        'class_names': prompt_learner.class_names,
+        'class_token_position': args.class_token_position,
+        'dataset': args.dataset,
+        'lr': args.lr,
+        'weight_decay': args.weight_decay
+    }
+    metadata_path = osp.join(epoch_dir, 'metadata.pth')
+    torch.save(metadata, metadata_path)
+    
+    print(f"Saved checkpoint for epoch {epoch} to {epoch_dir}")
+
+
+def train_prompts(prompt_learner, unet, vae, scheduler, train_loader, args):
+    """Train the learnable prompts using CoOp approach with differentiable diffusion loss"""
+    optimizer = optim.SGD(prompt_learner.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+    scheduler_lr = optim.lr_scheduler.CosineAnnealingLR(optimizer, args.max_epoch)
+    
+    # Create save directory with saving enabled
+    save_dir = None
+    if hasattr(args, 'save_folder') and args.save_folder:
+        save_dir = osp.join(DATASET_ROOT, 'prompts' , args.save_folder)
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"Will save checkpoints to: {save_dir}")
+    
+    print("Training learnable prompts...")
+    for epoch in range(args.max_epoch):
+        prompt_learner.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        pbar = tqdm.tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.max_epoch}")
+        for batch_idx, (images, labels) in enumerate(pbar):
+            optimizer.zero_grad()
+            
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            # Encode images to latents
+            with torch.no_grad():
+                if args.dtype == 'float16':
+                    images = images.half()
+                x0 = vae.encode(images).latent_dist.mean
+                x0 *= 0.18215
+            
+            # Get current prompt embeddings (this is differentiable)
+            text_embeddings = prompt_learner()
+            
+            # Compute classification loss for the batch
+            batch_loss = 0
+            batch_correct = 0
+            
+            for i, (latent, label) in enumerate(zip(x0, labels)):
+                # Use differentiable evaluation
+                class_probs, class_errors = eval_prob_adaptive_differentiable(
+                    unet, latent.unsqueeze(0), text_embeddings, scheduler, args, 
+                    args.img_size // 8
+                )
+                
+                # Cross-entropy loss using the class probabilities
+                target = torch.tensor([label], device=device)
+                loss = F.cross_entropy(class_probs.unsqueeze(0), target)
+                batch_loss += loss
+                
+                # For accuracy calculation
+                pred_idx = torch.argmax(class_probs).item()
+                if pred_idx == label.item():
+                    batch_correct += 1
+            
+            batch_loss = batch_loss / len(images)
+            batch_loss.backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(prompt_learner.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            total_loss += batch_loss.item()
+            correct += batch_correct
+            total += len(images)
+            
+            pbar.set_postfix({
+                'Loss': f'{total_loss/(batch_idx+1):.4f}',
+                'Acc': f'{100*correct/total:.2f}%'
+            })
+        
+        scheduler_lr.step()
+        
+        print(f"Epoch {epoch+1}: Loss = {total_loss/len(train_loader):.4f}, "
+              f"Acc = {100*correct/total:.2f}%")
         
         # Save checkpoint after each epoch
-        save_checkpoint(epoch, template_learner, optimizer, avg_epoch_loss, checkpoint_dir)
-        
-        # Print template stats for monitoring
-        if epoch % 2 == 0:
-            template = template_learner.get_global_template()
-            print(f"Template norm: {template.norm().item():.4f}, mean: {template.mean().item():.4f}")
-    
-    save_path = "templates/global_template_learner.pt"
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    template_learner.save(save_path)
-    print(f"Saved learned global template to {save_path}")
-
-    # Optionally save just the template embedding for reuse
-    template_embedding_path = "templates/global_template_embedding.pt"
-    torch.save(template_learner.get_global_template(), template_embedding_path)
-    print(f"Saved global template embedding to {template_embedding_path}")
+        if save_dir is not None:
+            save_epoch_checkpoints(prompt_learner, epoch + 1, save_dir, args)
 
 
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
-    parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
-                            help='Model data type to use')
+    # Original dataset args
     parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
                                  'objectnet', 'aircraft'], help='Dataset to use')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
-    parser.add_argument('--resume', action='store_true', help='Resume training from the latest checkpoint')
+
+    # Original run args
+    parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
+    parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
+    parser.add_argument('--batch_size', '-b', type=int, default=32)
+    parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
+    parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
+    parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
+                        help='Model data type to use')
+    parser.add_argument('--interpolation', type=str, default='bicubic', help='Resize interpolation type')
+    parser.add_argument('--loss', type=str, default='l2', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
+
+    # CoOp training args
+    parser.add_argument('--n_ctx', type=int, default=16, help='Number of context tokens')
+    parser.add_argument('--ctx_init', type=str, default='a blurry photo of a', help='Initial context')
+    parser.add_argument('--class_token_position', type=str, default='end', 
+                        choices=['end', 'middle', 'front'], help='Position of class token')
+    parser.add_argument('--lr', type=float, default=0.002, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.0005, help='Weight decay')
+    parser.add_argument('--max_epoch', type=int, default=50, help='Maximum training epochs')
+    
+    # Folder saving argument
+    parser.add_argument('--save_folder', type=str, default='learned_prompts1', 
+                        help='Folder name in DATASET_ROOT to save epoch checkpoints')
 
     args = parser.parse_args()
-    run(args)
 
-if __name__ == "__main__":
+    # Set up dataset and transforms
+    interpolation = INTERPOLATIONS[args.interpolation]
+    transform = get_transform(interpolation, args.img_size)
+    
+    # Load datasets
+    train_dataset = get_target_dataset(args.dataset, train=True, transform=transform)
+    test_dataset = get_target_dataset(args.dataset, train=False, transform=transform)
+    
+    # Create data loaders
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, 
+                                             shuffle=True, num_workers=4)
+    
+    # Load pretrained models
+    vae, tokenizer, text_encoder, unet, scheduler = get_sd_model(args)
+    vae = vae.to(device)
+    text_encoder = text_encoder.to(device)
+    unet = unet.to(device)
+    torch.backends.cudnn.benchmark = True
+    
+    class_names = train_dataset.classes 
+
+    # Initialize prompt learner (now requires text_encoder for proper initialization)
+    prompt_learner = PromptLearner(class_names, tokenizer, text_encoder, args.n_ctx, 
+                                 args.ctx_init, args.class_token_position).to(device)
+    
+    train_prompts(prompt_learner, unet, vae, scheduler, train_loader, args)
+
+
+if __name__ == '__main__':
     main()
