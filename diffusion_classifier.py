@@ -15,7 +15,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
-from learnable_templates import TemplatePromptLearner
+from learnable_templates import PromptLearner
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -115,20 +115,10 @@ class DiffusionEvaluator:
         
     def _setup_prompts(self):
         if self.args.template_path is not None:
-            # Load the saved TemplatePromptLearner
-            template_learner = TemplatePromptLearner(
-                tokenizer=self.tokenizer,
-                text_encoder=self.text_encoder,
-                n_template_tokens=32,  # Match the saved template dimensions
-                class_max_length=45,   # Match the saved template dimensions
-                device=self.device
-            ).to(self.device)
-            # Load the saved state
-            template_learner.load(self.args.template_path, map_location=self.device)
-            template_learner.eval()
-            # Generate embeddings using the learned template
-            with torch.inference_mode():
-                self.text_embeddings = template_learner.get_prompt_embeds(self.classnames)
+            prompt_learner = PromptLearner(self.target_dataset.classes, self.tokenizer, self.text_encoder, n_ctx=16).to(self.device)
+            prompt_learner.load_state_dict(torch.load(self.args.template_path))
+            self.text_embeddings = prompt_learner()
+            print(f"Loaded learned templates from {self.args.template_path}")
         else: 
             self.prompts_df = pd.read_csv(self.args.prompt_path)
             
