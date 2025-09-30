@@ -189,30 +189,28 @@ def eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
     
     idx = 0
     
-    context_manager = torch.enable_grad()
-    
-    with context_manager:
-        for _ in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
-            batch_ts = torch.tensor(ts[idx: idx + batch_size])
-            noise = all_noise[noise_idxs[idx: idx + batch_size]]
-            noised_latent = latent * (scheduler.alphas_cumprod[batch_ts] ** 0.5).view(-1, 1, 1, 1).to(device) + \
-                            noise * ((1 - scheduler.alphas_cumprod[batch_ts]) ** 0.5).view(-1, 1, 1, 1).to(device)
-            t_input = batch_ts.to(device).half() if dtype == 'float16' else batch_ts.to(device)
-            text_input = text_embeds[text_embed_idxs[idx: idx + batch_size]]
-            noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
-            
-            if loss == 'l2':
-                error = F.mse_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            elif loss == 'l1':
-                error = F.l1_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            elif loss == 'huber':
-                error = F.huber_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
-            else:
-                raise NotImplementedError
-            
-            pred_errors_list.append(error)
 
-            idx += len(batch_ts)
+    for _ in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
+        batch_ts = torch.tensor(ts[idx: idx + batch_size])
+        noise = all_noise[noise_idxs[idx: idx + batch_size]]
+        noised_latent = latent * (scheduler.alphas_cumprod[batch_ts] ** 0.5).view(-1, 1, 1, 1).to(device) + \
+                        noise * ((1 - scheduler.alphas_cumprod[batch_ts]) ** 0.5).view(-1, 1, 1, 1).to(device)
+        t_input = batch_ts.to(device).half() if dtype == 'float16' else batch_ts.to(device)
+        text_input = text_embeds[text_embed_idxs[idx: idx + batch_size]]
+        noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
+        
+        if loss == 'l2':
+            error = F.mse_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+        elif loss == 'l1':
+            error = F.l1_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+        elif loss == 'huber':
+            error = F.huber_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
+        else:
+            raise NotImplementedError
+        
+        pred_errors_list.append(error)
+
+        idx += len(batch_ts)
 
     pred_errors = torch.cat(pred_errors_list, dim=0)
     
@@ -236,7 +234,7 @@ def eval_prob_adaptive_differentiable(unet, latent, text_embeds, scheduler, args
         all_noise = all_noise.half()
         scheduler.alphas_cumprod = scheduler.alphas_cumprod.half()
     
-    n_timesteps = 50 
+    n_timesteps = 50
     timesteps = torch.randint(0, T, (n_timesteps,), device=latent.device)
 
     class_errors = []
@@ -328,6 +326,7 @@ def train_prompts(prompt_learner, unet, vae, scheduler, train_loader, args):
             
             images = images.to(device)
             labels = labels.to(device)
+            print(images.shape, labels.shape)
             
             # Encode images to latents
             with torch.no_grad():
@@ -373,7 +372,7 @@ def train_prompts(prompt_learner, unet, vae, scheduler, train_loader, args):
             total += len(images)
             
             pbar.set_postfix({
-                'Loss': f'{total_loss/(batch_idx+1):.4f}',
+                'Loss': f'{total_loss/(batch_idx+1):.6f}',
                 'Acc': f'{100*correct/total:.2f}%'
             })
         
@@ -399,7 +398,7 @@ def main():
     # Original run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
-    parser.add_argument('--batch_size', '-b', type=int, default=32)
+    parser.add_argument('--batch_size', '-b', type=int, default=2)
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
@@ -440,6 +439,13 @@ def main():
     text_encoder = text_encoder.to(device)
     unet = unet.to(device)
     torch.backends.cudnn.benchmark = True
+
+    for param in vae.parameters():
+        param.requires_grad = False
+    for param in text_encoder.parameters():
+        param.requires_grad = False
+    for param in unet.parameters():
+        param.requires_grad = False
     
     class_names = train_dataset.classes 
 

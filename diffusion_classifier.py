@@ -114,14 +114,15 @@ class DiffusionEvaluator:
         self.target_dataset = get_target_dataset(self.args.dataset, train=self.args.split == 'train', transform=transform)
         
     def _setup_prompts(self):
+        self.prompts_df = pd.read_csv(self.args.prompt_path)
         if self.args.template_path is not None:
-            prompt_learner = PromptLearner(self.target_dataset.classes, self.tokenizer, self.text_encoder, n_ctx=16).to(self.device)
+            # fix
+            prompt_learner = PromptLearner(self.target_dataset.classes, self.tokenizer, self.text_encoder,
+                                            n_ctx=16, ctx_init='a blurry photo of a', class_token_position='end').to(self.device)
             prompt_learner.load_state_dict(torch.load(self.args.template_path))
             self.text_embeddings = prompt_learner()
             print(f"Loaded learned templates from {self.args.template_path}")
         else: 
-            self.prompts_df = pd.read_csv(self.args.prompt_path)
-            
             # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L276
             text_input = self.tokenizer(self.prompts_df.prompt.tolist(), padding="max_length",
                                 max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
