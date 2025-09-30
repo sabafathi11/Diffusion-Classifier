@@ -16,14 +16,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
 from learnable_templates import PromptLearner
+from transformers import AutoModelForImageSegmentation
+from PIL import Image
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 seed = 42
 
-torch.manual_seed(seed)             # sets seed for CPU
-torch.cuda.manual_seed(seed)        # sets seed for current GPU
-torch.cuda.manual_seed_all(seed)    # sets seed for all GPUs (if you use multi-GPU)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 np.random.seed(seed) 
 
 INTERPOLATIONS = {
@@ -57,26 +59,65 @@ def create_balanced_subset(dataset, samples_per_class):
     """Create a balanced subset of the dataset with specified samples per class."""
     class_to_indices = defaultdict(list)
     
-    # Group indices by class
     for idx in range(len(dataset)):
         _, label = dataset[idx]
         class_to_indices[label].append(idx)
     
     balanced_indices = []
     
-    # Sample from each class
     for class_label, indices in class_to_indices.items():
         if len(indices) >= samples_per_class:
-            # If we have enough samples, randomly select
             selected = np.random.choice(indices, samples_per_class, replace=False)
         else:
-            # If we don't have enough samples, take all available
             selected = indices
             print(f"Warning: Class {class_label} only has {len(indices)} samples, less than requested {samples_per_class}")
         
         balanced_indices.extend(selected.tolist() if hasattr(selected, 'tolist') else selected)
     
     return sorted(balanced_indices)
+
+
+class BackgroundRemover:
+    """Wrapper for BiRefNet background removal."""
+    
+    def __init__(self, device="cuda"):
+        print("Loading BiRefNet for background removal...")
+        torch.set_float32_matmul_precision("high")
+        
+        self.birefnet = AutoModelForImageSegmentation.from_pretrained(
+            "ZhengPeng7/BiRefNet", trust_remote_code=True
+        ).to(device)
+        
+        self.transform_image = torch_transforms.Compose([
+            torch_transforms.Resize((1024, 1024)),
+            torch_transforms.ToTensor(),
+            torch_transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        
+        self.device = device
+        print("BiRefNet loaded successfully")
+    
+    def remove_background(self, image: Image.Image) -> Image.Image:
+        """Remove background from a PIL image."""
+        image_size = image.size
+        input_images = self.transform_image(image).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            preds = self.birefnet(input_images)[-1].sigmoid().cpu()
+        
+        pred = preds[0].squeeze()
+        pred_pil = torch_transforms.ToPILImage()(pred)
+        mask = pred_pil.resize(image_size)
+        
+        # Convert to RGB if not already (some datasets may have grayscale)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Create RGBA image with transparency
+        image = image.convert('RGBA')
+        image.putalpha(mask)
+        
+        return image
 
 
 class DiffusionEvaluator:
@@ -96,6 +137,12 @@ class DiffusionEvaluator:
         self._setup_noise()
         self._setup_run_folder()
         self._setup_class_names()
+        
+        # Setup background remover if requested
+        if self.args.remove_background:
+            self.bg_remover = BackgroundRemover(device=self.device)
+        else:
+            self.bg_remover = None
   
         
     def _setup_models(self):
@@ -116,14 +163,12 @@ class DiffusionEvaluator:
     def _setup_prompts(self):
         self.prompts_df = pd.read_csv(self.args.prompt_path)
         if self.args.template_path is not None:
-            # fix
             prompt_learner = PromptLearner(self.target_dataset.classes, self.tokenizer, self.text_encoder,
                                             n_ctx=16, ctx_init='a blurry photo of a', class_token_position='end').to(self.device)
             prompt_learner.load_state_dict(torch.load(self.args.template_path))
             self.text_embeddings = prompt_learner()
             print(f"Loaded learned templates from {self.args.template_path}")
         else: 
-            # refer to https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L276
             text_input = self.tokenizer(self.prompts_df.prompt.tolist(), padding="max_length",
                                 max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
             embeddings = []
@@ -137,7 +182,6 @@ class DiffusionEvaluator:
             assert len(self.text_embeddings) == len(self.prompts_df)
         
     def _setup_noise(self):
-        # load noise
         if self.args.noise_path is not None:
             assert not self.args.zero_noise
             self.all_noise = torch.load(self.args.noise_path).to(self.device)
@@ -146,7 +190,6 @@ class DiffusionEvaluator:
             self.all_noise = None
             
     def _setup_run_folder(self):
-        # make run output folder
         name = f"v{self.args.version}_{self.args.n_trials}trials_"
         name += '_'.join(map(str, self.args.to_keep)) + 'keep_'
         name += '_'.join(map(str, self.args.n_samples)) + 'samples'
@@ -160,6 +203,8 @@ class DiffusionEvaluator:
             name += f'_{self.args.img_size}'
         if self.args.samples_per_class is not None:
             name += f'_{self.args.samples_per_class}spc'
+        if self.args.remove_background:
+            name += '_nobg'
         if self.args.extra is not None:
             self.run_folder = osp.join(LOG_DIR, self.args.dataset + '_' + self.args.extra, name)
         else:
@@ -170,15 +215,31 @@ class DiffusionEvaluator:
     def _setup_class_names(self):
         """Setup class name mapping"""
         if hasattr(self.target_dataset, 'classes'):
-            # For datasets with class names
             for idx, class_name in enumerate(self.target_dataset.classes):
                 self.classidx_to_name[idx] = class_name
         elif self.args.prompt_path is not None and hasattr(self, 'prompts_df'):
-            # If using prompts, try to extract class names from prompts_df
             if 'class_name' in self.prompts_df.columns:
                 for _, row in self.prompts_df.iterrows():
                     self.classidx_to_name[row['classidx']] = row['class_name']
         self.classnames = [self.classidx_to_name.get(i, str(i)) for i in range(len(self.classidx_to_name))]
+    
+    def process_image_tensor(self, image_tensor):
+        """Convert tensor to PIL, remove background, convert back to tensor."""
+        # Convert from tensor [-1, 1] to PIL
+        image_pil = torch_transforms.ToPILImage()(image_tensor * 0.5 + 0.5)
+        
+        # Remove background
+        image_nobg = self.bg_remover.remove_background(image_pil)
+        
+        # Convert back to RGB (paste on white background to handle transparency)
+        bg = Image.new('RGB', image_nobg.size, (255, 255, 255))
+        bg.paste(image_nobg, mask=image_nobg.split()[3] if image_nobg.mode == 'RGBA' else None)
+        
+        # Convert back to tensor [-1, 1]
+        image_tensor_out = torch_transforms.ToTensor()(bg)
+        image_tensor_out = torch_transforms.Normalize([0.5], [0.5])(image_tensor_out)
+        
+        return image_tensor_out
     
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
         scheduler_config = get_scheduler_config(args)
@@ -211,7 +272,7 @@ class DiffusionEvaluator:
             t_evaluated.update(curr_t_to_eval)
             pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
                                      text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss)
-            # match up computed errors to the data
+            
             for prompt_i in remaining_prmpt_idxs:
                 mask = torch.tensor(text_embed_idxs) == prompt_i
                 prompt_ts = torch.tensor(ts)[mask]
@@ -222,12 +283,10 @@ class DiffusionEvaluator:
                     data[prompt_i]['t'] = torch.cat([data[prompt_i]['t'], prompt_ts])
                     data[prompt_i]['pred_errors'] = torch.cat([data[prompt_i]['pred_errors'], prompt_pred_errors])
 
-            # compute the next remaining idxs
             errors = [-data[prompt_i]['pred_errors'].mean() for prompt_i in remaining_prmpt_idxs]
             best_idxs = torch.topk(torch.tensor(errors), k=n_to_keep, dim=0).indices.tolist()
             remaining_prmpt_idxs = [remaining_prmpt_idxs[i] for i in best_idxs]
 
-        # organize the output
         assert len(remaining_prmpt_idxs) == 1
         pred_idx = remaining_prmpt_idxs[0]
         
@@ -235,7 +294,7 @@ class DiffusionEvaluator:
         for prompt_i in data:
             all_losses[prompt_i] = data[prompt_i]['pred_errors'].mean()
 
-        return all_losses,pred_idx, data
+        return all_losses, pred_idx, data
 
     def eval_error(self, unet, scheduler, latent, all_noise, ts, noise_idxs,
                    text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2'):
@@ -272,14 +331,11 @@ class DiffusionEvaluator:
             print("No predictions available for confusion matrix")
             return
         
-        # Get unique class labels and their names
         unique_labels = sorted(list(set(self.all_labels + self.all_predictions)))
         class_names = [self.classidx_to_name.get(label, str(label)) for label in unique_labels]
         
-        # Compute confusion matrix
         cm = confusion_matrix(self.all_labels, self.all_predictions, labels=unique_labels)
         
-        # Create figure
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
                    xticklabels=class_names, yticklabels=class_names)
@@ -298,7 +354,6 @@ class DiffusionEvaluator:
             print(f"Confusion matrix saved to {osp.join(self.run_folder, 'confusion_matrix.png')}")
         plt.close()
         
-        # Save classification report
         report = classification_report(self.all_labels, self.all_predictions, 
                                      labels=unique_labels, target_names=class_names)
         report_path = osp.join(self.run_folder, 'classification_report.txt')
@@ -317,7 +372,6 @@ class DiffusionEvaluator:
             f.write("Diffusion Classification Results Summary\n")
             f.write("=======================================\n\n")
             
-            # Overall accuracy
             correct = sum(1 for p, l in zip(self.all_predictions, self.all_labels) if p == l)
             total = len(self.all_predictions)
             accuracy = (correct / total * 100) if total > 0 else 0
@@ -327,10 +381,10 @@ class DiffusionEvaluator:
             f.write(f"Correct predictions: {correct}\n")
             f.write(f"Accuracy: {accuracy:.2f}%\n\n")
             
-            # Diffusion model configuration
             f.write(f"Model Configuration:\n")
             f.write(f"Version: {self.args.version}\n")
             f.write(f"Image size: {self.args.img_size}\n")
+            f.write(f"Background removal: {self.args.remove_background}\n")
             f.write(f"Batch size: {self.args.batch_size}\n")
             f.write(f"Number of trials: {self.args.n_trials}\n")
             f.write(f"Loss function: {self.args.loss}\n")
@@ -339,7 +393,6 @@ class DiffusionEvaluator:
             f.write(f"Adaptive sampling - n_samples: {self.args.n_samples}\n")
             f.write(f"Adaptive sampling - to_keep: {self.args.to_keep}\n\n")
             
-            # Per-class accuracy if we have class names
             if hasattr(self, 'classidx_to_name') and len(self.classidx_to_name) > 0:
                 f.write("Per-class Results:\n")
                 class_stats = {}
@@ -358,11 +411,9 @@ class DiffusionEvaluator:
         print(f"Results summary saved to {summary_path}")
 
     def run_evaluation(self):
-        # subset of dataset to evaluate
         if self.args.subset_path is not None:
             idxs = np.load(self.args.subset_path).tolist()
         elif self.args.samples_per_class is not None:
-            # Create balanced subset
             idxs = create_balanced_subset(self.target_dataset, self.args.samples_per_class)
             print(f'Created balanced subset with {len(idxs)} total samples')
         else:
@@ -383,11 +434,16 @@ class DiffusionEvaluator:
                     data = torch.load(fname)
                     correct += int(data['pred'] == data['label'])
                     total += 1
-                    # Track predictions and labels for summary
                     self.all_predictions.append(data['pred'])
                     self.all_labels.append(data['label'])
                 continue
+            
             image, label = self.target_dataset[i]
+            
+            # Remove background if requested
+            if self.args.remove_background:
+                image = self.process_image_tensor(image)
+            
             with torch.no_grad():
                 img_input = image.to(self.device).unsqueeze(0)
                 if self.args.dtype == 'float16':
@@ -397,7 +453,7 @@ class DiffusionEvaluator:
 
             text_embeddings_to_use = self.text_embeddings
                 
-            _,pred_idx, pred_errors = self.eval_prob_adaptive(
+            _, pred_idx, pred_errors = self.eval_prob_adaptive(
                 self.unet, x0, text_embeddings_to_use, self.scheduler, 
                 self.args, self.latent_size, self.all_noise
             )
@@ -409,11 +465,9 @@ class DiffusionEvaluator:
                 correct += 1
             total += 1
             
-            # Track predictions and labels for summary
             self.all_predictions.append(pred)
             self.all_labels.append(label)
         
-        # Generate confusion matrix and summary after evaluation
         self.plot_confusion_matrix()
         self.save_results_summary()
 
@@ -422,20 +476,20 @@ def main():
     parser = argparse.ArgumentParser()
 
     # dataset args
-    parser.add_argument('--dataset', type=str, default='pets',
+    parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
                                  'objectnet', 'aircraft'], help='Dataset to use')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
 
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
-    parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Number of trials per timestep')
+    parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
     parser.add_argument('--batch_size', '-b', type=int, default=32)
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
-    parser.add_argument('--prompt_path', type=str, default=None, help='Path to csv file with prompts to use')
+    parser.add_argument('--prompt_path', type=str, default='prompts/cifar10_prompts.csv', help='Path to csv file with prompts to use')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
-    parser.add_argument('--samples_per_class', type=int, default=None, help='Number of samples per class for balanced subset')
+    parser.add_argument('--samples_per_class', type=int, default=10, help='Number of samples per class for balanced subset')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
                         help='Model data type to use')
     parser.add_argument('--interpolation', type=str, default='bicubic', help='Resize interpolation type')
@@ -443,17 +497,17 @@ def main():
     parser.add_argument('--n_workers', type=int, default=1, help='Number of workers to split the dataset across')
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
-    parser.add_argument('--loss', type=str, default='l2', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
+    parser.add_argument('--loss', type=str, default='l1', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
     parser.add_argument('--template_path', type=str, default=None, help='Path to learned templates to use')
+    parser.add_argument('--remove_background', action='store_true', default=True, help='Remove background using BiRefNet before classification')
 
     # args for adaptively choosing which classes to continue trying
-    parser.add_argument('--to_keep', nargs='+', type=int, required=True)
-    parser.add_argument('--n_samples', nargs='+', type=int, required=True)
+    parser.add_argument('--to_keep', nargs='+', type=int, default=[1])
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[50])
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
 
-    # Create evaluator and run
     evaluator = DiffusionEvaluator(args)
     evaluator.run_evaluation()
 

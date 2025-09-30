@@ -11,6 +11,7 @@ from diffusion.models import get_sd_model, get_scheduler_config
 from diffusion.utils import DATASET_ROOT
 import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
+from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 
 """
 batch_size = 32-128
@@ -163,7 +164,11 @@ class PromptLearner(nn.Module):
         position_ids = torch.arange(prompts.size(1), device=prompts.device).unsqueeze(0)
         position_embeddings = self.text_encoder.text_model.embeddings.position_embedding(position_ids)
         hidden_states = prompts + position_embeddings
-        mask = torch.ones(prompts.size(0), 1, prompts.size(1), prompts.size(1), device=prompts.device).type(hidden_states.dtype)
+        mask =  _create_4d_causal_attention_mask(
+            input_shape=(prompts.size(0), prompts.size(1)),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device
+        )
 
         encoder_outputs = self.text_encoder.text_model.encoder(
             hidden_states,
@@ -257,8 +262,10 @@ def eval_prob_adaptive_differentiable(unet, latent, text_embeds, scheduler, args
     
     # Use softmax with temperature to convert errors to probabilities
     # Negative because lower error should mean higher probability
+
+    # saba_fix 
     temperature = 0.1
-    probs = F.softmax(-class_errors / temperature, dim=0)
+    probs = -class_errors / temperature
     return probs, class_errors
 
 

@@ -16,14 +16,16 @@ from learnable_templates import PromptLearner
 from PIL import Image
 import glob
 import random
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 seed = 42
 
-torch.manual_seed(seed)             # sets seed for CPU
-torch.cuda.manual_seed(seed)        # sets seed for current GPU
-torch.cuda.manual_seed_all(seed)    # sets seed for all GPUs (if you use multi-GPU)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 np.random.seed(seed) 
 random.seed(seed)
 
@@ -78,14 +80,12 @@ class CABDataset:
     """Custom dataset for CAB fruit images"""
     def __init__(self, root_dir, mode='compound', transform=None):
         self.root_dir = root_dir
-        self.mode = mode  # 'compound' or 'single'
+        self.mode = mode
         self.transform = transform
         
         if mode == 'compound':
-            # Load compound images from fruit_combinations folder
             self.image_paths = glob.glob(osp.join(root_dir, "fruit_combinations", "*.jpg"))
         else:
-            # Load single images from single_images folder
             self.image_paths = glob.glob(osp.join(root_dir, "single_images", "*.jpg"))
         
         print(f"Found {len(self.image_paths)} {mode} images")
@@ -100,16 +100,12 @@ class CABDataset:
         if self.transform:
             image = self.transform(image)
             
-        # Extract fruit names from filename
         filename = osp.basename(image_path)
-        # Remove extension and number suffix
         name_part = filename.replace('.jpg', '').rsplit('_', 1)[0]
         
         if self.mode == 'compound':
-            # For compound images, expect two fruits separated by underscore
             fruits = name_part.split('_')
         else:
-            # For single images, expect one fruit name
             fruits = [name_part]
             
         return image, fruits, image_path
@@ -121,19 +117,22 @@ class DiffusionEvaluator:
         self.device = device
         
         # Initialize tracking variables for results
-        self.correct_predictions = 0  # Correct color predictions
-        self.other_fruit_predictions = 0  # Predictions that match other fruit's color (compound mode only)
-        self.other_mistakes = 0  # All other incorrect predictions
-        self.total_classifications = 0  # Total number of classifications performed
+        self.correct_predictions = 0
+        self.other_fruit_predictions = 0
+        self.other_mistakes = 0
+        self.total_classifications = 0
         
-        # Set up models and other components
+        # Confusion matrix for single mode
+        if self.args.mode == 'single':
+            self.confusion_matrix = np.zeros((len(ALL_COLORS), len(ALL_COLORS)), dtype=int)
+            self.color_to_idx = {color: idx for idx, color in enumerate(ALL_COLORS)}
+        
         self._setup_models()
         self._setup_dataset()
         self._setup_noise()
         self._setup_run_folder()
         
     def _setup_models(self):
-        # load pretrained models
         self.vae, self.tokenizer, self.text_encoder, self.unet, self.scheduler = get_sd_model(self.args)
         self.vae = self.vae.to(self.device)
         self.text_encoder = self.text_encoder.to(self.device)
@@ -141,14 +140,12 @@ class DiffusionEvaluator:
         torch.backends.cudnn.benchmark = True
         
     def _setup_dataset(self):
-        # set up dataset
         interpolation = INTERPOLATIONS[self.args.interpolation]
         transform = get_transform(interpolation, self.args.img_size)
         self.latent_size = self.args.img_size // 8
         self.target_dataset = CABDataset(self.args.cab_folder, mode=self.args.mode, transform=transform)
         
     def _setup_noise(self):
-        # load noise
         if self.args.noise_path is not None:
             assert not self.args.zero_noise
             self.all_noise = torch.load(self.args.noise_path).to(self.device)
@@ -157,7 +154,6 @@ class DiffusionEvaluator:
             self.all_noise = None
             
     def _setup_run_folder(self):
-        # make run output folder
         name = f"CAB_allcolors_{self.args.mode}_v{self.args.version}_{self.args.n_trials}trials_"
         name += '_'.join(map(str, self.args.to_keep)) + 'keep_'
         name += '_'.join(map(str, self.args.n_samples)) + 'samples'
@@ -180,8 +176,8 @@ class DiffusionEvaluator:
         """Create prompts for all 5 colors for a specific fruit"""
         prompts = []
         for color in ALL_COLORS:
-            prompt = f"In this picture, the color of the {target_fruit} is {color}."
             # f"In this picture, the color of the {target_fruit} is {color}."
+            prompt = f"A {color} {target_fruit}."
             prompts.append(prompt)
         return prompts
 
@@ -225,7 +221,6 @@ class DiffusionEvaluator:
             t_evaluated.update(curr_t_to_eval)
             pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
                                      text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss)
-            # match up computed errors to the data
             for prompt_i in remaining_prmpt_idxs:
                 mask = torch.tensor(text_embed_idxs) == prompt_i
                 prompt_ts = torch.tensor(ts)[mask]
@@ -236,12 +231,10 @@ class DiffusionEvaluator:
                     data[prompt_i]['t'] = torch.cat([data[prompt_i]['t'], prompt_ts])
                     data[prompt_i]['pred_errors'] = torch.cat([data[prompt_i]['pred_errors'], prompt_pred_errors])
 
-            # compute the next remaining idxs
             errors = [-data[prompt_i]['pred_errors'].mean() for prompt_i in remaining_prmpt_idxs]
             best_idxs = torch.topk(torch.tensor(errors), k=n_to_keep, dim=0).indices.tolist()
             remaining_prmpt_idxs = [remaining_prmpt_idxs[i] for i in best_idxs]
 
-        # organize the output
         assert len(remaining_prmpt_idxs) == 1
         pred_idx = remaining_prmpt_idxs[0]
         
@@ -282,73 +275,124 @@ class DiffusionEvaluator:
 
     def perform_color_classification_compound(self, image, fruit1, fruit2, target_fruit):
         """Perform color classification for a specific fruit in compound image"""
-        # Create prompts for all colors
         prompts = self.create_color_prompts(target_fruit)
         
-        # Encode prompts (5 prompts for all colors)
         text_input = self.tokenizer(prompts, padding="max_length",
                             max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
         
         with torch.inference_mode():
             text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
             
-            # Encode image
             img_input = image.to(self.device).unsqueeze(0)
             if self.args.dtype == 'float16':
                 img_input = img_input.half()
             x0 = self.vae.encode(img_input).latent_dist.mean
             x0 *= 0.18215
 
-        # Evaluate color classification (choose among 5 colors)
         all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
             self.unet, x0, text_embeddings, self.scheduler, 
             self.args, self.latent_size, self.all_noise
         )
         
-        # Get predicted color
         predicted_color = ALL_COLORS[pred_idx]
         correct_color = FRUIT_COLORS[target_fruit.lower()]
         other_fruit = fruit2 if target_fruit == fruit1 else fruit1
         other_fruit_color = FRUIT_COLORS[other_fruit.lower()]
         
-        # Classify the prediction
         prediction_type = self.classify_prediction(predicted_color, correct_color, other_fruit_color)
         
         return predicted_color, correct_color, prediction_type, prompts, pred_idx
 
     def perform_color_classification_single(self, image, fruit):
         """Perform color classification for a single fruit image"""
-        # Create prompts for all colors
         prompts = self.create_color_prompts(fruit)
         
-        # Encode prompts (5 prompts for all colors)
         text_input = self.tokenizer(prompts, padding="max_length",
                             max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
         
         with torch.inference_mode():
             text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
             
-            # Encode image
             img_input = image.to(self.device).unsqueeze(0)
             if self.args.dtype == 'float16':
                 img_input = img_input.half()
             x0 = self.vae.encode(img_input).latent_dist.mean
             x0 *= 0.18215
 
-        # Evaluate color classification (choose among 5 colors)
         all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
             self.unet, x0, text_embeddings, self.scheduler, 
             self.args, self.latent_size, self.all_noise
         )
         
-        # Get predicted color
         predicted_color = ALL_COLORS[pred_idx]
         correct_color = FRUIT_COLORS[fruit.lower()]
         
-        # Classify the prediction (no other fruit in single mode)
         prediction_type = self.classify_prediction(predicted_color, correct_color, None)
         
         return predicted_color, correct_color, prediction_type, prompts, pred_idx
+
+    def save_confusion_matrix(self):
+        """Save confusion matrix visualization and CSV for single mode"""
+        if self.args.mode != 'single':
+            return
+        
+        # Save as CSV
+        df = pd.DataFrame(self.confusion_matrix, index=ALL_COLORS, columns=ALL_COLORS)
+        csv_path = osp.join(self.run_folder, 'confusion_matrix.csv')
+        df.to_csv(csv_path)
+        print(f"Confusion matrix saved to {csv_path}")
+        
+        # Create visualization
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(self.confusion_matrix, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=ALL_COLORS, yticklabels=ALL_COLORS,
+                    cbar_kws={'label': 'Count'})
+        plt.xlabel('Predicted Color')
+        plt.ylabel('True Color')
+        plt.title('Color Classification Confusion Matrix')
+        plt.tight_layout()
+        
+        # Save figure
+        fig_path = osp.join(self.run_folder, 'confusion_matrix.png')
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Confusion matrix visualization saved to {fig_path}")
+        
+        # Calculate and save per-class metrics
+        metrics_path = osp.join(self.run_folder, 'per_class_metrics.txt')
+        with open(metrics_path, 'w') as f:
+            f.write("Per-Class Metrics\n")
+            f.write("=" * 50 + "\n\n")
+            
+            for i, color in enumerate(ALL_COLORS):
+                true_positives = self.confusion_matrix[i, i]
+                false_positives = self.confusion_matrix[:, i].sum() - true_positives
+                false_negatives = self.confusion_matrix[i, :].sum() - true_positives
+                total_true = self.confusion_matrix[i, :].sum()
+                
+                if total_true > 0:
+                    recall = true_positives / total_true * 100
+                else:
+                    recall = 0.0
+                
+                if (true_positives + false_positives) > 0:
+                    precision = true_positives / (true_positives + false_positives) * 100
+                else:
+                    precision = 0.0
+                
+                if (precision + recall) > 0:
+                    f1 = 2 * (precision * recall) / (precision + recall)
+                else:
+                    f1 = 0.0
+                
+                f.write(f"{color.upper()}:\n")
+                f.write(f"  Total samples: {total_true}\n")
+                f.write(f"  Correct predictions: {true_positives}\n")
+                f.write(f"  Precision: {precision:.2f}%\n")
+                f.write(f"  Recall: {recall:.2f}%\n")
+                f.write(f"  F1-Score: {f1:.2f}\n\n")
+        
+        print(f"Per-class metrics saved to {metrics_path}")
 
     def save_results_summary(self):
         """Save a summary of color classification results."""
@@ -379,7 +423,6 @@ class DiffusionEvaluator:
             else:
                 f.write(f"Expected for {len(self.target_dataset)} single images: {len(self.target_dataset)} classifications\n\n")
             
-            # Model configuration
             f.write(f"Model Configuration:\n")
             f.write(f"Mode: {self.args.mode}\n")
             f.write(f"Version: {self.args.version}\n")
@@ -400,7 +443,7 @@ class DiffusionEvaluator:
         """Run evaluation for compound images"""
         idxs_to_eval = list(range(len(self.target_dataset)))
         
-        formatstr = get_formatstr(len(self.target_dataset) * 2 - 1)  # *2 because 2 classifications per image
+        formatstr = get_formatstr(len(self.target_dataset) * 2 - 1)
         pbar = tqdm.tqdm(idxs_to_eval)
         
         for i in pbar:
@@ -420,9 +463,8 @@ class DiffusionEvaluator:
                 print(f"Skipping {image_path}: Unknown fruits {fruit1}, {fruit2}")
                 continue
             
-            # Perform 2 color classifications per image (one for each fruit)
             for fruit_idx, target_fruit in enumerate([fruit1, fruit2]):
-                classification_idx = i * 2 + fruit_idx  # Unique index for each classification
+                classification_idx = i * 2 + fruit_idx
                 fname = osp.join(self.run_folder, formatstr.format(classification_idx) + '.pt')
                 
                 if os.path.exists(fname):
@@ -439,12 +481,10 @@ class DiffusionEvaluator:
                         self.total_classifications += 1
                     continue
                 
-                # Perform color classification
                 predicted_color, correct_color, prediction_type, prompts, pred_idx = self.perform_color_classification_compound(
                     image, fruit1, fruit2, target_fruit
                 )
                 
-                # Update counters
                 if prediction_type == 'correct':
                     self.correct_predictions += 1
                 elif prediction_type == 'other_fruit':
@@ -454,7 +494,6 @@ class DiffusionEvaluator:
                 
                 self.total_classifications += 1
                 
-                # Save results for this classification
                 torch.save(dict(
                     predicted_color=predicted_color,
                     correct_color=correct_color,
@@ -471,7 +510,7 @@ class DiffusionEvaluator:
         """Run evaluation for single images"""
         idxs_to_eval = list(range(len(self.target_dataset)))
         
-        formatstr = get_formatstr(len(self.target_dataset) - 1)  # 1 classification per image
+        formatstr = get_formatstr(len(self.target_dataset) - 1)
         pbar = tqdm.tqdm(idxs_to_eval)
         
         for i in pbar:
@@ -490,7 +529,6 @@ class DiffusionEvaluator:
                 print(f"Skipping {image_path}: Unknown fruit {fruit}")
                 continue
             
-            # Perform 1 color classification per image
             fname = osp.join(self.run_folder, formatstr.format(i) + '.pt')
             
             if os.path.exists(fname):
@@ -498,6 +536,14 @@ class DiffusionEvaluator:
                 if self.args.load_stats:
                     data = torch.load(fname)
                     prediction_type = data['prediction_type']
+                    predicted_color = data['predicted_color']
+                    correct_color = data['correct_color']
+                    
+                    # Update confusion matrix
+                    true_idx = self.color_to_idx[correct_color]
+                    pred_idx = self.color_to_idx[predicted_color]
+                    self.confusion_matrix[true_idx, pred_idx] += 1
+                    
                     if prediction_type == 'correct':
                         self.correct_predictions += 1
                     else:
@@ -505,12 +551,15 @@ class DiffusionEvaluator:
                     self.total_classifications += 1
                 continue
             
-            # Perform color classification
             predicted_color, correct_color, prediction_type, prompts, pred_idx = self.perform_color_classification_single(
                 image, fruit
             )
             
-            # Update counters
+            # Update confusion matrix
+            true_idx = self.color_to_idx[correct_color]
+            pred_idx_cm = self.color_to_idx[predicted_color]
+            self.confusion_matrix[true_idx, pred_idx_cm] += 1
+            
             if prediction_type == 'correct':
                 self.correct_predictions += 1
             else:
@@ -518,7 +567,6 @@ class DiffusionEvaluator:
             
             self.total_classifications += 1
             
-            # Save results for this classification
             torch.save(dict(
                 predicted_color=predicted_color,
                 correct_color=correct_color,
@@ -540,6 +588,10 @@ class DiffusionEvaluator:
         
         # Generate summary
         self.save_results_summary()
+        
+        # Save confusion matrix for single mode
+        if self.args.mode == 'single':
+            self.save_confusion_matrix()
         
         # Print final results
         if self.total_classifications > 0:
@@ -565,7 +617,7 @@ def main():
     parser.add_argument('--cab_folder', type=str,
                         default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/CAB',
                         help='Path to CAB folder containing fruit_combinations and single_images folders')
-    parser.add_argument('--mode', type=str, default='compound', choices=['compound', 'single'],
+    parser.add_argument('--mode', type=str, default='single', choices=['compound', 'single'],
                         help='Mode: compound for two-fruit images, single for single-fruit images')
     
     # run args
@@ -583,7 +635,7 @@ def main():
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', default=[1], type=int)
-    parser.add_argument('--n_samples', nargs='+', default=[500], type=int)
+    parser.add_argument('--n_samples', nargs='+', default=[50], type=int)
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
