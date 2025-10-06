@@ -15,7 +15,6 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
-from learnable_templates import PromptLearner
 from transformers import AutoModelForImageSegmentation
 from PIL import Image
 
@@ -163,24 +162,17 @@ class DiffusionEvaluator:
         
     def _setup_prompts(self):
         self.prompts_df = pd.read_csv(self.args.prompt_path)
-        if self.args.template_path is not None:
-            prompt_learner = PromptLearner(self.target_dataset.classes, self.tokenizer, self.text_encoder,
-                                            n_ctx=16, ctx_init='a blurry photo of a', class_token_position='end').to(self.device)
-            prompt_learner.load_state_dict(torch.load(self.args.template_path))
-            self.text_embeddings = prompt_learner()
-            print(f"Loaded learned templates from {self.args.template_path}")
-        else: 
-            text_input = self.tokenizer(self.prompts_df.prompt.tolist(), padding="max_length",
-                                max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
-            embeddings = []
-            with torch.inference_mode():
-                for i in range(0, len(text_input.input_ids), 100):
-                    text_embeddings = self.text_encoder(
-                        text_input.input_ids[i: i + 100].to(self.device),
-                    )[0]
-                    embeddings.append(text_embeddings)
-            self.text_embeddings = torch.cat(embeddings, dim=0)
-            assert len(self.text_embeddings) == len(self.prompts_df)
+        text_input = self.tokenizer(self.prompts_df.prompt.tolist(), padding="max_length",
+                            max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
+        embeddings = []
+        with torch.inference_mode():
+            for i in range(0, len(text_input.input_ids), 100):
+                text_embeddings = self.text_encoder(
+                    text_input.input_ids[i: i + 100].to(self.device),
+                )[0]
+                embeddings.append(text_embeddings)
+        self.text_embeddings = torch.cat(embeddings, dim=0)
+        assert len(self.text_embeddings) == len(self.prompts_df)
         
     def _setup_noise(self):
         if self.args.noise_path is not None:
@@ -499,7 +491,6 @@ def main():
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
     parser.add_argument('--loss', type=str, default='l1', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
-    parser.add_argument('--template_path', type=str, default=None, help='Path to learned templates to use')
     parser.add_argument('--remove_background', action='store_true', default=True, help='Remove background using BiRefNet before classification')
 
     # args for adaptively choosing which classes to continue trying
