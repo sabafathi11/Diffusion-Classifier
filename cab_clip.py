@@ -13,6 +13,7 @@ from collections import defaultdict
 from PIL import Image
 import glob
 import random
+from diffusion.utils import LOG_DIR
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -145,9 +146,9 @@ class CLIPColorEvaluator:
         if self.args.img_size != 224:  # CLIP default size
             name += f'_{self.args.img_size}'
         if self.args.extra is not None:
-            self.run_folder = osp.join('logs', 'CAB_CLIP_' + self.args.extra, name)
+            self.run_folder = osp.join(LOG_DIR, 'CAB_CLIP_' + self.args.extra, name)
         else:
-            self.run_folder = osp.join('logs', 'CAB_CLIP', name)
+            self.run_folder = osp.join(LOG_DIR, 'CAB_CLIP', name)
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
@@ -449,13 +450,13 @@ def main():
     parser.add_argument('--cab_folder', type=str,
                         default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/CAB',
                         help='Path to CAB folder containing fruit_combinations and single_images folders')
-    parser.add_argument('--mode', type=str, default='single', choices=['compound', 'single'],
+    parser.add_argument('--mode', type=str, default='compound', choices=['compound', 'single'],
                         help='Mode: compound for two-fruit images, single for single-fruit images')
     
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Version identifier for logging')
     parser.add_argument('--img_size', type=int, default=224, help='Image size (CLIP default is 224)')
-    parser.add_argument('--prompt_template', type=str, default='descriptive', 
+    parser.add_argument('--prompt_template', type=str, default='simple', 
                         choices=['simple', 'descriptive', 'natural'],
                         help='Template for generating color prompts')
     parser.add_argument('--extra', type=str, default=None, help='To append to the run folder name')

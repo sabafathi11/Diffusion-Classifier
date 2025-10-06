@@ -76,6 +76,25 @@ def center_crop_resize(img, interpolation=InterpolationMode.BILINEAR):
     return transform(img)
 
 
+import torch
+
+def compute_timestep_weight(t, T):
+    """
+    Compute weighting function w_t := exp(-7t) where t is normalized to [0, 1]
+    Args:
+        t: timestep value (integer or tensor)
+        T: total number of timesteps (e.g., 1000)
+    Returns:
+        weight: exp(-7 * t_normalized) as a tensor
+    """
+    t = torch.tensor(t, dtype=torch.float16)  # ensure tensor
+    T = torch.tensor(T, dtype=torch.float16)
+    t_normalized = t / T
+    weight = torch.exp(-7.0 * t_normalized)
+    return weight
+
+
+
 class CABDataset:
     """Custom dataset for CAB fruit images"""
     def __init__(self, root_dir, mode='compound', transform=None):
@@ -165,6 +184,8 @@ class DiffusionEvaluator:
             name += '_huber'
         if self.args.img_size != 512:
             name += f'_{self.args.img_size}'
+        # Add weighted suffix
+        name += '_weighted'
         if self.args.extra is not None:
             self.run_folder = osp.join(LOG_DIR, 'CAB_' + self.args.extra, name)
         else:
@@ -205,7 +226,10 @@ class DiffusionEvaluator:
         t_evaluated = set()
         remaining_prmpt_idxs = list(range(len(text_embeds)))
         start = T // max_n_samples // 2
-        t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
+
+        t_to_eval = np.linspace(800, 999, max_n_samples, dtype=int).tolist()
+        # t_to_eval = [900] * max_n_samples
+        # t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
 
         for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
             ts = []
@@ -220,7 +244,7 @@ class DiffusionEvaluator:
                     text_embed_idxs.extend([prompt_i] * args.n_trials)
             t_evaluated.update(curr_t_to_eval)
             pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss)
+                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, T)
             for prompt_i in remaining_prmpt_idxs:
                 mask = torch.tensor(text_embed_idxs) == prompt_i
                 prompt_ts = torch.tensor(ts)[mask]
@@ -245,7 +269,7 @@ class DiffusionEvaluator:
         return all_losses, pred_idx, data
 
     def eval_error(self, unet, scheduler, latent, all_noise, ts, noise_idxs,
-                   text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2'):
+                   text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2', T=1000):
         assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
         pred_errors = torch.zeros(len(ts), device='cpu')
         idx = 0
@@ -269,6 +293,11 @@ class DiffusionEvaluator:
                     error = F.huber_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
                 else:
                     raise NotImplementedError
+                
+                # Apply timestep weighting: w_t = exp(-7 * t_normalized)
+                # weights = torch.stack([compute_timestep_weight(t.item(), T) for t in batch_ts]).to(error.device)
+                # weighted_error = error * weights
+
                 pred_errors[idx: idx + len(batch_ts)] = error.detach().cpu()
                 idx += len(batch_ts)
         return pred_errors
@@ -349,7 +378,7 @@ class DiffusionEvaluator:
                     cbar_kws={'label': 'Count'})
         plt.xlabel('Predicted Color')
         plt.ylabel('True Color')
-        plt.title('Color Classification Confusion Matrix')
+        plt.title('Color Classification Confusion Matrix (Weighted)')
         plt.tight_layout()
         
         # Save figure
@@ -361,7 +390,7 @@ class DiffusionEvaluator:
         # Calculate and save per-class metrics
         metrics_path = osp.join(self.run_folder, 'per_class_metrics.txt')
         with open(metrics_path, 'w') as f:
-            f.write("Per-Class Metrics\n")
+            f.write("Per-Class Metrics (Weighted)\n")
             f.write("=" * 50 + "\n\n")
             
             for i, color in enumerate(ALL_COLORS):
@@ -399,6 +428,7 @@ class DiffusionEvaluator:
         summary_path = osp.join(self.run_folder, 'results_summary.txt')
         with open(summary_path, 'w') as f:
             f.write(f"CAB Color Diffusion Classification Results Summary ({self.args.mode.title()} Mode)\n")
+            f.write(f"Using Timestep Weighting: w_t = exp(-7t)\n")
             f.write("==========================================================\n\n")
             
             if self.total_classifications > 0:
@@ -432,6 +462,7 @@ class DiffusionEvaluator:
             f.write(f"Loss function: {self.args.loss}\n")
             f.write(f"Data type: {self.args.dtype}\n")
             f.write(f"Interpolation: {self.args.interpolation}\n")
+            f.write(f"Timestep weighting: exp(-7t)\n")
             f.write(f"Adaptive sampling - n_samples: {self.args.n_samples}\n")
             f.write(f"Adaptive sampling - to_keep: {self.args.to_keep}\n\n")
             
@@ -596,7 +627,7 @@ class DiffusionEvaluator:
         # Print final results
         if self.total_classifications > 0:
             correct_acc = 100 * self.correct_predictions / self.total_classifications
-            print(f"\nFinal Color Classification Results ({self.args.mode.title()} Mode):")
+            print(f"\nFinal Color Classification Results ({self.args.mode.title()} Mode, Weighted):")
             print(f"Total classifications: {self.total_classifications}")
             print(f"Correct color predictions: {self.correct_predictions} ({correct_acc:.2f}%)")
             

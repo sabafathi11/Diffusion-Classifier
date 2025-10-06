@@ -21,7 +21,7 @@ from PIL import Image
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-seed = 42
+seed = 43
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
@@ -98,7 +98,7 @@ class BackgroundRemover:
         print("BiRefNet loaded successfully")
     
     def remove_background(self, image: Image.Image) -> Image.Image:
-        """Remove background from a PIL image."""
+        """Remove background from a PIL image and replace with white."""
         image_size = image.size
         input_images = self.transform_image(image).unsqueeze(0).to(self.device)
         
@@ -109,16 +109,17 @@ class BackgroundRemover:
         pred_pil = torch_transforms.ToPILImage()(pred)
         mask = pred_pil.resize(image_size)
         
-        # Convert to RGB if not already (some datasets may have grayscale)
+        # Convert to RGB if not already
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
-        # Create RGBA image with transparency
-        image = image.convert('RGBA')
-        image.putalpha(mask)
+        # Create white background
+        white_background = Image.new('RGB', image_size, (255, 255, 255))
         
-        return image
-
+        # Composite the image onto white background using the mask
+        white_background.paste(image, mask=mask)
+        
+        return white_background
 
 class DiffusionEvaluator:
     def __init__(self, args):
@@ -476,7 +477,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # dataset args
-    parser.add_argument('--dataset', type=str, default='cifar10',
+    parser.add_argument('--dataset', type=str, default='pets',
                         choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
                                  'objectnet', 'aircraft'], help='Dataset to use')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
@@ -486,7 +487,7 @@ def main():
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
     parser.add_argument('--batch_size', '-b', type=int, default=32)
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
-    parser.add_argument('--prompt_path', type=str, default='prompts/cifar10_prompts.csv', help='Path to csv file with prompts to use')
+    parser.add_argument('--prompt_path', type=str, default='prompts/pets_prompts.csv', help='Path to csv file with prompts to use')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
     parser.add_argument('--samples_per_class', type=int, default=10, help='Number of samples per class for balanced subset')
