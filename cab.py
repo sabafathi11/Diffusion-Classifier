@@ -12,12 +12,12 @@ from diffusion.utils import LOG_DIR, get_formatstr
 import torchvision.transforms as torch_transforms
 from torchvision.transforms.functional import InterpolationMode
 from collections import defaultdict
-from learnable_templates import PromptLearner
 from PIL import Image
 import glob
 import random
 import matplotlib.pyplot as plt
 import seaborn as sns
+from datetime import datetime
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -59,11 +59,25 @@ ALL_COLORS = ['yellow', 'red', 'green', 'purple', 'orange']
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
 
+def pad_to_square(image):
+    """Pad image to square shape"""
+    width, height = image.size
+    max_dim = max(width, height)
+    
+    # Calculate padding for each side
+    pad_left = (max_dim - width) // 2
+    pad_right = max_dim - width - pad_left
+    pad_top = (max_dim - height) // 2
+    pad_bottom = max_dim - height - pad_top
+    
+    # Apply padding (left, top, right, bottom)
+    padding = (pad_left, pad_top, pad_right, pad_bottom)
+    return torch_transforms.functional.pad(image, padding, fill=255, padding_mode='constant')
 
 def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     transform = torch_transforms.Compose([
+        torch_transforms.Lambda(pad_to_square),
         torch_transforms.Resize(size, interpolation=interpolation),
-        torch_transforms.CenterCrop(size),
         _convert_image_to_rgb,
         torch_transforms.ToTensor(),
         torch_transforms.Normalize([0.5], [0.5])
@@ -210,63 +224,6 @@ class DiffusionEvaluator:
             return 'other_fruit'
         else:
             return 'other_mistake'
-    
-    def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
-        scheduler_config = get_scheduler_config(args)
-        T = scheduler_config['num_train_timesteps']
-        max_n_samples = max(args.n_samples)
-
-        if all_noise is None:
-            all_noise = torch.randn((max_n_samples * args.n_trials, 4, latent_size, latent_size), device=latent.device)
-        if args.dtype == 'float16':
-            all_noise = all_noise.half()
-            scheduler.alphas_cumprod = scheduler.alphas_cumprod.half()
-
-        data = dict()
-        t_evaluated = set()
-        remaining_prmpt_idxs = list(range(len(text_embeds)))
-        start = T // max_n_samples // 2
-
-        t_to_eval = np.linspace(800, 999, max_n_samples, dtype=int).tolist()
-        # t_to_eval = [900] * max_n_samples
-        # t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
-
-        for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
-            ts = []
-            noise_idxs = []
-            text_embed_idxs = []
-            curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
-            curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
-            for prompt_i in remaining_prmpt_idxs:
-                for t_idx, t in enumerate(curr_t_to_eval, start=len(t_evaluated)):
-                    ts.extend([t] * args.n_trials)
-                    noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
-                    text_embed_idxs.extend([prompt_i] * args.n_trials)
-            t_evaluated.update(curr_t_to_eval)
-            pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, T)
-            for prompt_i in remaining_prmpt_idxs:
-                mask = torch.tensor(text_embed_idxs) == prompt_i
-                prompt_ts = torch.tensor(ts)[mask]
-                prompt_pred_errors = pred_errors[mask]
-                if prompt_i not in data:
-                    data[prompt_i] = dict(t=prompt_ts, pred_errors=prompt_pred_errors)
-                else:
-                    data[prompt_i]['t'] = torch.cat([data[prompt_i]['t'], prompt_ts])
-                    data[prompt_i]['pred_errors'] = torch.cat([data[prompt_i]['pred_errors'], prompt_pred_errors])
-
-            errors = [-data[prompt_i]['pred_errors'].mean() for prompt_i in remaining_prmpt_idxs]
-            best_idxs = torch.topk(torch.tensor(errors), k=n_to_keep, dim=0).indices.tolist()
-            remaining_prmpt_idxs = [remaining_prmpt_idxs[i] for i in best_idxs]
-
-        assert len(remaining_prmpt_idxs) == 1
-        pred_idx = remaining_prmpt_idxs[0]
-        
-        all_losses = torch.zeros(len(text_embeds))
-        for prompt_i in data:
-            all_losses[prompt_i] = data[prompt_i]['pred_errors'].mean()
-
-        return all_losses, pred_idx, data
 
     def eval_error(self, unet, scheduler, latent, all_noise, ts, noise_idxs,
                    text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2', T=1000):
@@ -302,6 +259,257 @@ class DiffusionEvaluator:
                 idx += len(batch_ts)
         return pred_errors
 
+    def eval_error_visualize(self, unet, scheduler, vae, original_image, latent, all_noise, ts, noise_idxs,
+                text_embeds, text_embed_idxs, target_fruit, batch_size=32, dtype='float32', loss='l2', T=1000,
+                visualize=False, prompts=None):
+        """
+        Evaluate denoising error in pixel space with comprehensive visualization.
+        
+        Args:
+            prompts: List of prompt strings corresponding to text_embeds (needed for visualization titles)
+        """
+        assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
+        pred_errors = torch.zeros(len(ts), device='cpu')
+        idx = 0
+        
+        # Store data for visualization - organized by prompt
+        if visualize:
+            viz_data = defaultdict(lambda: {'images': [], 'errors': [], 'timesteps': []})
+        
+        with torch.inference_mode():
+            for batch_idx in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
+                batch_ts = torch.tensor(ts[idx: idx + batch_size])
+                batch_text_idxs = text_embed_idxs[idx: idx + batch_size]
+                noise = all_noise[noise_idxs[idx: idx + batch_size]]
+                
+                # Create noised latent
+                alpha_prod_t = scheduler.alphas_cumprod[batch_ts]
+                sqrt_alpha_prod = (alpha_prod_t ** 0.5).view(-1, 1, 1, 1).to(self.device)
+                sqrt_one_minus_alpha_prod = ((1 - alpha_prod_t) ** 0.5).view(-1, 1, 1, 1).to(self.device)
+                
+                noised_latent = latent * sqrt_alpha_prod + noise * sqrt_one_minus_alpha_prod
+                
+                # Prepare inputs
+                t_input = batch_ts.to(self.device).half() if dtype == 'float16' else batch_ts.to(self.device)
+                text_input = text_embeds[batch_text_idxs]
+                if dtype == 'float16':
+                    text_input = text_input.half()
+                    noised_latent = noised_latent.half()
+                
+                # Predict noise
+                noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
+                
+                # Denoise to get predicted clean latent
+                denoised_latent = (noised_latent - sqrt_one_minus_alpha_prod * noise_pred) / sqrt_alpha_prod
+                
+                reconstructed_image = vae.decode(denoised_latent / vae.config.scaling_factor).sample
+            
+                # Convert to float32 for error computation if needed
+                if dtype == 'float16':
+                    reconstructed_image = reconstructed_image.float()
+                
+                # Compute error in pixel space
+                if loss == 'l2':
+                    error = F.mse_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                elif loss == 'l1':
+                    error = F.l1_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                elif loss == 'huber':
+                    error = F.huber_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                else:
+                    raise NotImplementedError
+                
+                # Average over spatial dimensions for the metric
+                pred_errors[idx: idx + len(batch_ts)] = error.mean(dim=(1, 2)).detach().cpu()
+                
+                # Store samples for visualization - group by prompt
+                if visualize:
+                    for i in range(len(batch_ts)):
+                        prompt_idx = batch_text_idxs[i]
+                        viz_data[prompt_idx]['images'].append(reconstructed_image[i].detach().cpu())
+                        viz_data[prompt_idx]['errors'].append(error[i].detach().cpu())
+                        viz_data[prompt_idx]['timesteps'].append(batch_ts[i].item())
+                
+                idx += len(batch_ts)
+        
+        # Create visualizations for all prompts
+        if visualize and len(viz_data) > 0:
+            timestamp = datetime.now().strftime("%H%M%S")
+            
+            for prompt_idx, data in viz_data.items():
+                prompt_text = prompts[prompt_idx] if prompts is not None else f"Prompt {prompt_idx}"
+                
+                # Convert lists to tensors
+                recon_images = torch.stack(data['images'])
+                error_maps = torch.stack(data['errors'])
+                timesteps = torch.tensor(data['timesteps'])
+                
+                save_path = osp.join(self.run_folder, f'error_heatmap_prompt{prompt_idx}_{timestamp}.png')
+                self.visualize_error_heatmap(
+                    original_image, target_fruit, recon_images, error_maps, 
+                    timesteps, prompt_text, save_path=save_path
+                )
+        
+        return pred_errors
+
+
+    def visualize_error_heatmap(self, original_image, target_fruit, reconstructed_images, 
+                            error_maps, timesteps, prompt_text, save_path=None):
+        """
+        Visualize original image, reconstructed images, and error heatmaps for all timesteps.
+
+        Args:
+            original_image: Original image tensor (B, C, H, W)
+            target_fruit: Name of target fruit
+            reconstructed_images: Reconstructed images tensor (N, C, H, W) - all timesteps
+            error_maps: Error maps tensor (N, H, W)
+            timesteps: Timesteps for each image (N,)
+            prompt_text: The prompt text being evaluated
+            save_path: Path to save the figure
+        """
+        num_samples = len(reconstructed_images)
+        
+        # Sort by timestep for better visualization
+        sort_idx = torch.argsort(timesteps)
+        timesteps = timesteps[sort_idx]
+        reconstructed_images = reconstructed_images[sort_idx]
+        error_maps = error_maps[sort_idx]
+        
+        # Determine grid layout
+        max_cols = 6  # Maximum images per row
+        num_rows = (num_samples + max_cols - 1) // max_cols
+        num_cols = min(num_samples, max_cols)
+        
+        fig = plt.figure(figsize=(5 * num_cols, 10 * num_rows))
+        gs = fig.add_gridspec(num_rows + 1, num_cols, hspace=0.3, wspace=0.3)
+        
+        # Convert original image to numpy and normalize to [0, 1]
+        orig_img = ((original_image[0].cpu().numpy().transpose(1, 2, 0) + 1) / 2).clip(0, 1).astype(np.float32)
+        
+        # Plot original image spanning first row
+        ax_orig = fig.add_subplot(gs[0, :])
+        ax_orig.imshow(orig_img)
+        ax_orig.set_title(f'Original Image: {target_fruit}\nPrompt: "{prompt_text}"', 
+                        fontsize=12, fontweight='bold')
+        ax_orig.axis('off')
+        
+        # Plot reconstructed images and error maps
+        for i in range(num_samples):
+            row = (i // num_cols) + 1
+            col = i % num_cols
+            
+            # Create subplot with 2 rows for this position
+            ax = fig.add_subplot(gs[row, col])
+            
+            recon_img = ((reconstructed_images[i].cpu().numpy().transpose(1, 2, 0) + 1) / 2).clip(0, 1).astype(np.float32)
+            error_map = error_maps[i].cpu().numpy().astype(np.float32)
+            
+            # Create combined visualization: reconstructed on top, error heatmap on bottom
+            combined_height = recon_img.shape[0] + error_map.shape[0]
+            ax.clear()
+            
+            # Show reconstructed image
+            ax.imshow(recon_img, extent=[0, 1, 0.5, 1])
+            
+            # Show error heatmap
+            im = ax.imshow(error_map, cmap='hot', interpolation='nearest', 
+                        extent=[0, 1, 0, 0.5], aspect='auto')
+            
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_title(f't={timesteps[i].item()}\nAvg Error: {error_map.mean():.4f}', 
+                        fontsize=10)
+            ax.axis('off')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.ax.tick_params(labelsize=8)
+        
+        plt.suptitle(f'Reconstruction Error Analysis Across All Timesteps\nTarget: {target_fruit}', 
+                    fontsize=14, fontweight='bold', y=0.995)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Visualization saved to {save_path}")
+            plt.close()
+        
+        return fig
+
+
+    # Update the eval_prob_adaptive method to pass prompts
+    def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, target_fruit, 
+                        latent_size=64, all_noise=None, prompts=None):
+        """
+        Args:
+            prompts: List of prompt strings for visualization titles
+        """
+        scheduler_config = get_scheduler_config(args)
+        T = scheduler_config['num_train_timesteps']
+        max_n_samples = max(args.n_samples)
+
+        if all_noise is None:
+            all_noise = torch.randn((max_n_samples * args.n_trials, 4, latent_size, latent_size), 
+                                device=latent.device)
+        if args.dtype == 'float16':
+            all_noise = all_noise.half()
+            scheduler.alphas_cumprod = scheduler.alphas_cumprod.half()
+
+        data = dict()
+        t_evaluated = set()
+        remaining_prmpt_idxs = list(range(len(text_embeds)))
+        start = T // max_n_samples // 2
+
+        t_to_eval = np.linspace(800, 999, max_n_samples, dtype=int).tolist()
+        
+        for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
+            ts = []
+            noise_idxs = []
+            text_embed_idxs = []
+            curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
+            curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
+            
+            for prompt_i in remaining_prmpt_idxs:
+                for t_idx, t in enumerate(curr_t_to_eval, start=len(t_evaluated)):
+                    ts.extend([t] * args.n_trials)
+                    noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
+                    text_embed_idxs.extend([prompt_i] * args.n_trials)
+            t_evaluated.update(curr_t_to_eval)
+            
+            # Pass prompts to eval_error for visualization
+            if args.visualize:
+                pred_errors = self.eval_error_visualize(
+                    unet, scheduler, self.vae, image, latent, all_noise, ts, noise_idxs,
+                    text_embeds, text_embed_idxs, target_fruit, args.batch_size, args.dtype, 
+                    args.loss, T, visualize=False, prompts=prompts
+                )
+            else:
+                pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
+                                    text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, T)
+            
+            for prompt_i in remaining_prmpt_idxs:
+                mask = torch.tensor(text_embed_idxs) == prompt_i
+                prompt_ts = torch.tensor(ts)[mask]
+                prompt_pred_errors = pred_errors[mask]
+                if prompt_i not in data:
+                    data[prompt_i] = dict(t=prompt_ts, pred_errors=prompt_pred_errors)
+                else:
+                    data[prompt_i]['t'] = torch.cat([data[prompt_i]['t'], prompt_ts])
+                    data[prompt_i]['pred_errors'] = torch.cat([data[prompt_i]['pred_errors'], prompt_pred_errors])
+
+            errors = [-data[prompt_i]['pred_errors'].mean() for prompt_i in remaining_prmpt_idxs]
+            best_idxs = torch.topk(torch.tensor(errors), k=n_to_keep, dim=0).indices.tolist()
+            remaining_prmpt_idxs = [remaining_prmpt_idxs[i] for i in best_idxs]
+
+        assert len(remaining_prmpt_idxs) == 1
+        pred_idx = remaining_prmpt_idxs[0]
+        
+        all_losses = torch.zeros(len(text_embeds))
+        for prompt_i in data:
+            all_losses[prompt_i] = data[prompt_i]['pred_errors'].mean()
+
+        return all_losses, pred_idx, data
+
+
+    # Update the classification methods to pass prompts
     def perform_color_classification_compound(self, image, fruit1, fruit2, target_fruit):
         """Perform color classification for a specific fruit in compound image"""
         prompts = self.create_color_prompts(target_fruit)
@@ -320,7 +528,8 @@ class DiffusionEvaluator:
 
         all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
             self.unet, x0, text_embeddings, self.scheduler, 
-            self.args, self.latent_size, self.all_noise
+            self.args, img_input, target_fruit, self.latent_size, self.all_noise,
+            prompts=prompts  # Pass prompts here
         )
         
         predicted_color = ALL_COLORS[pred_idx]
@@ -350,7 +559,7 @@ class DiffusionEvaluator:
 
         all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
             self.unet, x0, text_embeddings, self.scheduler, 
-            self.args, self.latent_size, self.all_noise
+            self.args, image, fruit, self.latent_size, self.all_noise, prompts=prompts
         )
         
         predicted_color = ALL_COLORS[pred_idx]
@@ -648,7 +857,7 @@ def main():
     parser.add_argument('--cab_folder', type=str,
                         default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/CAB',
                         help='Path to CAB folder containing fruit_combinations and single_images folders')
-    parser.add_argument('--mode', type=str, default='single', choices=['compound', 'single'],
+    parser.add_argument('--mode', type=str, default='compound', choices=['compound', 'single'],
                         help='Mode: compound for two-fruit images, single for single-fruit images')
     
     # run args
@@ -667,6 +876,8 @@ def main():
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', default=[1], type=int)
     parser.add_argument('--n_samples', nargs='+', default=[50], type=int)
+
+    parser.add_argument('--visualize', action='store_true', default=False, help='Visualize error heatmaps during evaluation')
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)

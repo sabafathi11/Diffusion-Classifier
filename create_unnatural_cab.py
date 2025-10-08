@@ -32,8 +32,8 @@ except ImportError as e:
 
 # Fruit definitions with their natural colors
 FRUIT_COLORS = {
-    # 'cherry': 'red',
-    # 'pomegranate': 'red',
+    'cherry': 'red',
+    'pomegranate': 'red',
     'strawberry': 'red',
     'tomato': 'red',
     'banana': 'yellow',
@@ -305,7 +305,7 @@ Example:
         """
     )
     
-    parser.add_argument("--images-per-fruit", type=int, default=35,
+    parser.add_argument("--images-per-fruit", type=int, default=10,
                        help="Number of images per fruit (default: 35)")
     parser.add_argument("--size", default="1024x1024", 
                        choices=["1024x1024", "1024x1792", "1792x1024"],
