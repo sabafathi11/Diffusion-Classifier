@@ -18,6 +18,7 @@ import random
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
+import re
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -35,7 +36,7 @@ INTERPOLATIONS = {
     'lanczos': InterpolationMode.LANCZOS,
 }
 
-# Fruit color mapping
+# Fruit color mapping (natural colors)
 FRUIT_COLORS = {
     'cherry': 'red',
     'pomegranate': 'red', 
@@ -90,23 +91,55 @@ def center_crop_resize(img, interpolation=InterpolationMode.BILINEAR):
     return transform(img)
 
 
-import torch
 
-def compute_timestep_weight(t, T):
+def parse_compound_unnatural_filename(filename):
     """
-    Compute weighting function w_t := exp(-7t) where t is normalized to [0, 1]
-    Args:
-        t: timestep value (integer or tensor)
-        T: total number of timesteps (e.g., 1000)
-    Returns:
-        weight: exp(-7 * t_normalized) as a tensor
+    Parse unnatural fruit combination filename.
+    Expected format: compound_fruit1_color1_fruit2_color2_number.png
+    Example: compound_banana_green_brinjal_red_220.png
+    
+    Returns: (fruit1, color1, fruit2, color2) or None if parsing fails
     """
-    t = torch.tensor(t, dtype=torch.float16)  # ensure tensor
-    T = torch.tensor(T, dtype=torch.float16)
-    t_normalized = t / T
-    weight = torch.exp(-7.0 * t_normalized)
-    return weight
+    # Remove extension
+    name = filename.replace('.png', '').replace('.jpg', '')
+    
+    # Split by underscore
+    parts = name.split('_')
+    
+    # Expected: ['compound', fruit1, color1, fruit2, color2, number]
+    if len(parts) >= 6 and parts[0] == 'compound':
+        fruit1 = parts[1]
+        color1 = parts[2]
+        fruit2 = parts[3]
+        color2 = parts[4]
+        return fruit1, color1, fruit2, color2
+    
+    return None
 
+
+def parse_single_unnatural_filename(filename):
+    """
+    Parse single unnatural fruit filename.
+    Expected format: fruit_color_number1_number2.png
+    Example: banana_green_006_202011.png
+    Returns: (fruit, color) or None if parsing fails
+    """
+    # Remove extension
+    name = filename.replace('.png', '').replace('.jpg', '')
+    
+    # Split by underscore
+    parts = name.split('_')
+    
+    # Expected: [fruit, color, number1, number2]
+    if len(parts) >= 3:
+        fruit = parts[0]
+        color = parts[1]
+        
+        # Verify color is valid
+        if color in ALL_COLORS:
+            return fruit, color
+    
+    return None
 
 
 class CABDataset:
@@ -117,9 +150,17 @@ class CABDataset:
         self.transform = transform
         
         if mode == 'compound':
-            self.image_paths = glob.glob(osp.join(root_dir, "fruit_combinations", "*.jpg"))
-        else:
-            self.image_paths = glob.glob(osp.join(root_dir, "single_images", "*.jpg"))
+            self.image_paths = glob.glob(osp.join(root_dir, "compound", "*.jpg"))
+        elif mode == 'single':
+            self.image_paths = glob.glob(osp.join(root_dir, "single", "*.jpg"))
+        elif mode == 'compound_unnatural':
+            # Look for both jpg and png in unnatural_fruit_combinations
+            self.image_paths = glob.glob(osp.join(root_dir, "compound_unnatural", "*.jpg"))
+            self.image_paths += glob.glob(osp.join(root_dir, "compound_unnatural", "*.png"))
+        elif mode == 'single_unnatural':
+            # Look for both jpg and png in single_unnatural folder
+            self.image_paths = glob.glob(osp.join(root_dir, "single_unnatural", "*.jpg"))
+            self.image_paths += glob.glob(osp.join(root_dir, "single_unnatural", "*.png"))
         
         print(f"Found {len(self.image_paths)} {mode} images")
         
@@ -134,14 +175,40 @@ class CABDataset:
             image = self.transform(image)
             
         filename = osp.basename(image_path)
-        name_part = filename.replace('.jpg', '').rsplit('_', 1)[0]
         
-        if self.mode == 'compound':
-            fruits = name_part.split('_')
+        if self.mode == 'compound_unnatural':
+            # Parse the filename to extract fruit names and colors
+            parsed = parse_compound_unnatural_filename(filename)
+            if parsed is None:
+                print(f"Warning: Could not parse filename {filename}")
+                fruits = []
+                colors = {}
+            else:
+                fruit1, color1, fruit2, color2 = parsed
+                fruits = [fruit1, fruit2]
+                colors = {fruit1: color1, fruit2: color2}
+            return image, fruits, colors, image_path
+        elif self.mode == 'single_unnatural':
+            # Parse the filename to extract fruit name and color
+            parsed = parse_single_unnatural_filename(filename)
+            if parsed is None:
+                print(f"Warning: Could not parse filename {filename}")
+                fruits = []
+                color = None
+            else:
+                fruit, color = parsed
+                fruits = [fruit]
+            return image, fruits, color, image_path
         else:
-            fruits = [name_part]
+            # Original behavior for compound and single modes
+            name_part = filename.replace('.jpg', '').rsplit('_', 1)[0]
             
-        return image, fruits, image_path
+            if self.mode == 'compound':
+                fruits = name_part.split('_')
+            else:
+                fruits = [name_part]
+                
+            return image, fruits, image_path
 
 
 class DiffusionEvaluator:
@@ -156,7 +223,7 @@ class DiffusionEvaluator:
         self.total_classifications = 0
         
         # Confusion matrix for single mode
-        if self.args.mode == 'single':
+        if self.args.mode == 'single' or self.args.mode == 'single_unnatural':
             self.confusion_matrix = np.zeros((len(ALL_COLORS), len(ALL_COLORS)), dtype=int)
             self.color_to_idx = {color: idx for idx, color in enumerate(ALL_COLORS)}
         
@@ -198,8 +265,6 @@ class DiffusionEvaluator:
             name += '_huber'
         if self.args.img_size != 512:
             name += f'_{self.args.img_size}'
-        # Add weighted suffix
-        name += '_weighted'
         if self.args.extra is not None:
             self.run_folder = osp.join(LOG_DIR, 'CAB_' + self.args.extra, name)
         else:
@@ -211,7 +276,6 @@ class DiffusionEvaluator:
         """Create prompts for all 5 colors for a specific fruit"""
         prompts = []
         for color in ALL_COLORS:
-            # f"In this picture, the color of the {target_fruit} is {color}."
             prompt = f"A {color} {target_fruit}."
             prompts.append(prompt)
         return prompts
@@ -250,107 +314,102 @@ class DiffusionEvaluator:
                     error = F.huber_loss(noise, noise_pred, reduction='none').mean(dim=(1, 2, 3))
                 else:
                     raise NotImplementedError
-                
-                # Apply timestep weighting: w_t = exp(-7 * t_normalized)
-                # weights = torch.stack([compute_timestep_weight(t.item(), T) for t in batch_ts]).to(error.device)
-                # weighted_error = error * weights
 
                 pred_errors[idx: idx + len(batch_ts)] = error.detach().cpu()
                 idx += len(batch_ts)
         return pred_errors
-
+    
     def eval_error_visualize(self, unet, scheduler, vae, original_image, latent, all_noise, ts, noise_idxs,
-                text_embeds, text_embed_idxs, target_fruit, batch_size=32, dtype='float32', loss='l2', T=1000,
-                visualize=False, prompts=None):
-        """
-        Evaluate denoising error in pixel space with comprehensive visualization.
-        
-        Args:
-            prompts: List of prompt strings corresponding to text_embeds (needed for visualization titles)
-        """
-        assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
-        pred_errors = torch.zeros(len(ts), device='cpu')
-        idx = 0
-        
-        # Store data for visualization - organized by prompt
-        if visualize:
-            viz_data = defaultdict(lambda: {'images': [], 'errors': [], 'timesteps': []})
-        
-        with torch.inference_mode():
-            for batch_idx in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
-                batch_ts = torch.tensor(ts[idx: idx + batch_size])
-                batch_text_idxs = text_embed_idxs[idx: idx + batch_size]
-                noise = all_noise[noise_idxs[idx: idx + batch_size]]
-                
-                # Create noised latent
-                alpha_prod_t = scheduler.alphas_cumprod[batch_ts]
-                sqrt_alpha_prod = (alpha_prod_t ** 0.5).view(-1, 1, 1, 1).to(self.device)
-                sqrt_one_minus_alpha_prod = ((1 - alpha_prod_t) ** 0.5).view(-1, 1, 1, 1).to(self.device)
-                
-                noised_latent = latent * sqrt_alpha_prod + noise * sqrt_one_minus_alpha_prod
-                
-                # Prepare inputs
-                t_input = batch_ts.to(self.device).half() if dtype == 'float16' else batch_ts.to(self.device)
-                text_input = text_embeds[batch_text_idxs]
-                if dtype == 'float16':
-                    text_input = text_input.half()
-                    noised_latent = noised_latent.half()
-                
-                # Predict noise
-                noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
-                
-                # Denoise to get predicted clean latent
-                denoised_latent = (noised_latent - sqrt_one_minus_alpha_prod * noise_pred) / sqrt_alpha_prod
-                
-                reconstructed_image = vae.decode(denoised_latent / vae.config.scaling_factor).sample
+                    text_embeds, text_embed_idxs, target_fruit, batch_size=32, dtype='float32', loss='l2', T=1000,
+                    visualize=False, prompts=None):
+            """
+            Evaluate denoising error in pixel space with comprehensive visualization.
             
-                # Convert to float32 for error computation if needed
-                if dtype == 'float16':
-                    reconstructed_image = reconstructed_image.float()
-                
-                # Compute error in pixel space
-                if loss == 'l2':
-                    error = F.mse_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
-                elif loss == 'l1':
-                    error = F.l1_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
-                elif loss == 'huber':
-                    error = F.huber_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
-                else:
-                    raise NotImplementedError
-                
-                # Average over spatial dimensions for the metric
-                pred_errors[idx: idx + len(batch_ts)] = error.mean(dim=(1, 2)).detach().cpu()
-                
-                # Store samples for visualization - group by prompt
-                if visualize:
-                    for i in range(len(batch_ts)):
-                        prompt_idx = batch_text_idxs[i]
-                        viz_data[prompt_idx]['images'].append(reconstructed_image[i].detach().cpu())
-                        viz_data[prompt_idx]['errors'].append(error[i].detach().cpu())
-                        viz_data[prompt_idx]['timesteps'].append(batch_ts[i].item())
-                
-                idx += len(batch_ts)
-        
-        # Create visualizations for all prompts
-        if visualize and len(viz_data) > 0:
-            timestamp = datetime.now().strftime("%H%M%S")
+            Args:
+                prompts: List of prompt strings corresponding to text_embeds (needed for visualization titles)
+            """
+            assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
+            pred_errors = torch.zeros(len(ts), device='cpu')
+            idx = 0
             
-            for prompt_idx, data in viz_data.items():
-                prompt_text = prompts[prompt_idx] if prompts is not None else f"Prompt {prompt_idx}"
+            # Store data for visualization - organized by prompt
+            if visualize:
+                viz_data = defaultdict(lambda: {'images': [], 'errors': [], 'timesteps': []})
+            
+            with torch.inference_mode():
+                for batch_idx in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
+                    batch_ts = torch.tensor(ts[idx: idx + batch_size])
+                    batch_text_idxs = text_embed_idxs[idx: idx + batch_size]
+                    noise = all_noise[noise_idxs[idx: idx + batch_size]]
+                    
+                    # Create noised latent
+                    alpha_prod_t = scheduler.alphas_cumprod[batch_ts]
+                    sqrt_alpha_prod = (alpha_prod_t ** 0.5).view(-1, 1, 1, 1).to(self.device)
+                    sqrt_one_minus_alpha_prod = ((1 - alpha_prod_t) ** 0.5).view(-1, 1, 1, 1).to(self.device)
+                    
+                    noised_latent = latent * sqrt_alpha_prod + noise * sqrt_one_minus_alpha_prod
+                    
+                    # Prepare inputs
+                    t_input = batch_ts.to(self.device).half() if dtype == 'float16' else batch_ts.to(self.device)
+                    text_input = text_embeds[batch_text_idxs]
+                    if dtype == 'float16':
+                        text_input = text_input.half()
+                        noised_latent = noised_latent.half()
+                    
+                    # Predict noise
+                    noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
+                    
+                    # Denoise to get predicted clean latent
+                    denoised_latent = (noised_latent - sqrt_one_minus_alpha_prod * noise_pred) / sqrt_alpha_prod
+                    
+                    reconstructed_image = vae.decode(denoised_latent / vae.config.scaling_factor).sample
                 
-                # Convert lists to tensors
-                recon_images = torch.stack(data['images'])
-                error_maps = torch.stack(data['errors'])
-                timesteps = torch.tensor(data['timesteps'])
+                    # Convert to float32 for error computation if needed
+                    if dtype == 'float16':
+                        reconstructed_image = reconstructed_image.float()
+                    
+                    # Compute error in pixel space
+                    if loss == 'l2':
+                        error = F.mse_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                    elif loss == 'l1':
+                        error = F.l1_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                    elif loss == 'huber':
+                        error = F.huber_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                    else:
+                        raise NotImplementedError
+                    
+                    # Average over spatial dimensions for the metric
+                    pred_errors[idx: idx + len(batch_ts)] = error.mean(dim=(1, 2)).detach().cpu()
+                    
+                    # Store samples for visualization - group by prompt
+                    if visualize:
+                        for i in range(len(batch_ts)):
+                            prompt_idx = batch_text_idxs[i]
+                            viz_data[prompt_idx]['images'].append(reconstructed_image[i].detach().cpu())
+                            viz_data[prompt_idx]['errors'].append(error[i].detach().cpu())
+                            viz_data[prompt_idx]['timesteps'].append(batch_ts[i].item())
+                    
+                    idx += len(batch_ts)
+            
+            # Create visualizations for all prompts
+            if visualize and len(viz_data) > 0:
+                timestamp = datetime.now().strftime("%H%M%S")
                 
-                save_path = osp.join(self.run_folder, f'error_heatmap_prompt{prompt_idx}_{timestamp}.png')
-                self.visualize_error_heatmap(
-                    original_image, target_fruit, recon_images, error_maps, 
-                    timesteps, prompt_text, save_path=save_path
-                )
-        
-        return pred_errors
-
+                for prompt_idx, data in viz_data.items():
+                    prompt_text = prompts[prompt_idx] if prompts is not None else f"Prompt {prompt_idx}"
+                    
+                    # Convert lists to tensors
+                    recon_images = torch.stack(data['images'])
+                    error_maps = torch.stack(data['errors'])
+                    timesteps = torch.tensor(data['timesteps'])
+                    
+                    save_path = osp.join(self.run_folder, f'error_heatmap_prompt{prompt_idx}_{timestamp}.png')
+                    self.visualize_error_heatmap(
+                        original_image, target_fruit, recon_images, error_maps, 
+                        timesteps, prompt_text, save_path=save_path
+                    )
+            
+            return pred_errors
 
     def visualize_error_heatmap(self, original_image, target_fruit, reconstructed_images, 
                             error_maps, timesteps, prompt_text, save_path=None):
@@ -434,8 +493,6 @@ class DiffusionEvaluator:
         
         return fig
 
-
-    # Update the eval_prob_adaptive method to pass prompts
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, target_fruit, 
                         latent_size=64, all_noise=None, prompts=None):
         """
@@ -474,12 +531,11 @@ class DiffusionEvaluator:
                     text_embed_idxs.extend([prompt_i] * args.n_trials)
             t_evaluated.update(curr_t_to_eval)
             
-            # Pass prompts to eval_error for visualization
             if args.visualize:
                 pred_errors = self.eval_error_visualize(
                     unet, scheduler, self.vae, image, latent, all_noise, ts, noise_idxs,
                     text_embeds, text_embed_idxs, target_fruit, args.batch_size, args.dtype, 
-                    args.loss, T, visualize=False, prompts=prompts
+                    args.loss, T, visualize=True, prompts=prompts
                 )
             else:
                 pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
@@ -508,8 +564,6 @@ class DiffusionEvaluator:
 
         return all_losses, pred_idx, data
 
-
-    # Update the classification methods to pass prompts
     def perform_color_classification_compound(self, image, fruit1, fruit2, target_fruit):
         """Perform color classification for a specific fruit in compound image"""
         prompts = self.create_color_prompts(target_fruit)
@@ -529,13 +583,42 @@ class DiffusionEvaluator:
         all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
             self.unet, x0, text_embeddings, self.scheduler, 
             self.args, img_input, target_fruit, self.latent_size, self.all_noise,
-            prompts=prompts  # Pass prompts here
+            prompts=prompts
         )
         
         predicted_color = ALL_COLORS[pred_idx]
         correct_color = FRUIT_COLORS[target_fruit.lower()]
         other_fruit = fruit2 if target_fruit == fruit1 else fruit1
         other_fruit_color = FRUIT_COLORS[other_fruit.lower()]
+        
+        prediction_type = self.classify_prediction(predicted_color, correct_color, other_fruit_color)
+        
+        return predicted_color, correct_color, prediction_type, prompts, pred_idx
+
+    def perform_color_classification_compound_unnatural(self, image, fruit1, fruit2, target_fruit, target_color, other_fruit_color):
+        """Perform color classification for a specific fruit in unnatural compound image"""
+        prompts = self.create_color_prompts(target_fruit)
+        
+        text_input = self.tokenizer(prompts, padding="max_length",
+                            max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
+        
+        with torch.inference_mode():
+            text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
+            
+            img_input = image.to(self.device).unsqueeze(0)
+            if self.args.dtype == 'float16':
+                img_input = img_input.half()
+            x0 = self.vae.encode(img_input).latent_dist.mean
+            x0 *= 0.18215
+
+        all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
+            self.unet, x0, text_embeddings, self.scheduler, 
+            self.args, img_input, target_fruit, self.latent_size, self.all_noise,
+            prompts=prompts
+        )
+        
+        predicted_color = ALL_COLORS[pred_idx]
+        correct_color = target_color  # Use the color from filename
         
         prediction_type = self.classify_prediction(predicted_color, correct_color, other_fruit_color)
         
@@ -559,7 +642,7 @@ class DiffusionEvaluator:
 
         all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
             self.unet, x0, text_embeddings, self.scheduler, 
-            self.args, image, fruit, self.latent_size, self.all_noise, prompts=prompts
+            self.args, img_input, fruit, self.latent_size, self.all_noise, prompts=prompts
         )
         
         predicted_color = ALL_COLORS[pred_idx]
@@ -569,9 +652,38 @@ class DiffusionEvaluator:
         
         return predicted_color, correct_color, prediction_type, prompts, pred_idx
 
+    def perform_color_classification_single_unnatural(self, image, fruit, target_color):
+        """Perform color classification for a single unnatural fruit image"""
+        prompts = self.create_color_prompts(fruit)
+        
+        text_input = self.tokenizer(prompts, padding="max_length",
+                            max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
+        
+        with torch.inference_mode():
+            text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
+            
+            img_input = image.to(self.device).unsqueeze(0)
+            if self.args.dtype == 'float16':
+                img_input = img_input.half()
+            x0 = self.vae.encode(img_input).latent_dist.mean
+            x0 *= 0.18215
+
+        all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
+            self.unet, x0, text_embeddings, self.scheduler, 
+            self.args, img_input, fruit, self.latent_size, self.all_noise, prompts=prompts
+        )
+        
+        predicted_color = ALL_COLORS[pred_idx]
+        correct_color = target_color  # Use the color from filename
+        
+        prediction_type = self.classify_prediction(predicted_color, correct_color, None)
+        
+        return predicted_color, correct_color, prediction_type, prompts, pred_idx
+
+
     def save_confusion_matrix(self):
         """Save confusion matrix visualization and CSV for single mode"""
-        if self.args.mode != 'single':
+        if self.args.mode not in ['single', 'single_unnatural']:
             return
         
         # Save as CSV
@@ -587,7 +699,7 @@ class DiffusionEvaluator:
                     cbar_kws={'label': 'Count'})
         plt.xlabel('Predicted Color')
         plt.ylabel('True Color')
-        plt.title('Color Classification Confusion Matrix (Weighted)')
+        plt.title('Color Classification Confusion Matrix')
         plt.tight_layout()
         
         # Save figure
@@ -637,7 +749,6 @@ class DiffusionEvaluator:
         summary_path = osp.join(self.run_folder, 'results_summary.txt')
         with open(summary_path, 'w') as f:
             f.write(f"CAB Color Diffusion Classification Results Summary ({self.args.mode.title()} Mode)\n")
-            f.write(f"Using Timestep Weighting: w_t = exp(-7t)\n")
             f.write("==========================================================\n\n")
             
             if self.total_classifications > 0:
@@ -649,7 +760,7 @@ class DiffusionEvaluator:
                 f.write(f"Total classifications performed: {self.total_classifications}\n")
                 f.write(f"Correct color predictions: {self.correct_predictions} ({correct_acc:.2f}%)\n")
                 
-                if self.args.mode == 'compound':
+                if self.args.mode in ['compound', 'compound_unnatural']:
                     f.write(f"Other fruit color predictions: {self.other_fruit_predictions} ({other_fruit_acc:.2f}%)\n")
                     f.write(f"Other mistakes: {self.other_mistakes} ({other_mistakes_acc:.2f}%)\n\n")
                 else:
@@ -657,7 +768,7 @@ class DiffusionEvaluator:
             else:
                 f.write(f"No classifications performed.\n\n")
             
-            if self.args.mode == 'compound':
+            if self.args.mode in ['compound', 'compound_unnatural']:
                 f.write(f"Expected for {len(self.target_dataset)} compound images: {len(self.target_dataset) * 2} classifications\n\n")
             else:
                 f.write(f"Expected for {len(self.target_dataset)} single images: {len(self.target_dataset)} classifications\n\n")
@@ -671,7 +782,6 @@ class DiffusionEvaluator:
             f.write(f"Loss function: {self.args.loss}\n")
             f.write(f"Data type: {self.args.dtype}\n")
             f.write(f"Interpolation: {self.args.interpolation}\n")
-            f.write(f"Timestep weighting: exp(-7t)\n")
             f.write(f"Adaptive sampling - n_samples: {self.args.n_samples}\n")
             f.write(f"Adaptive sampling - to_keep: {self.args.to_keep}\n\n")
             
@@ -741,6 +851,89 @@ class DiffusionEvaluator:
                     pred_idx=pred_idx,
                     target_fruit=target_fruit,
                     fruits=[fruit1, fruit2],
+                    prompts=prompts,
+                    image_path=image_path,
+                    classification_idx=classification_idx
+                ), fname)
+
+    def run_evaluation_compound_unnatural(self):
+        """Run evaluation for unnatural fruit combination images"""
+        idxs_to_eval = list(range(len(self.target_dataset)))
+        
+        formatstr = get_formatstr(len(self.target_dataset) * 2 - 1)
+        pbar = tqdm.tqdm(idxs_to_eval)
+        
+        for i in pbar:
+            if self.total_classifications > 0:
+                correct_acc = 100 * self.correct_predictions / self.total_classifications
+                other_fruit_acc = 100 * self.other_fruit_predictions / self.total_classifications
+                pbar.set_description(f'Correct: {correct_acc:.1f}%, Other Fruit: {other_fruit_acc:.1f}% ({self.total_classifications})')
+            
+            image, fruits, colors, image_path = self.target_dataset[i]
+            
+            if len(fruits) != 2:
+                print(f"Skipping {image_path}: Expected 2 fruits, got {len(fruits)}")
+                continue
+            
+            if not colors or len(colors) != 2:
+                print(f"Skipping {image_path}: Could not parse colors from filename")
+                continue
+                
+            fruit1, fruit2 = fruits
+            
+            # Verify colors are valid
+            color1 = colors.get(fruit1)
+            color2 = colors.get(fruit2)
+            
+            if color1 not in ALL_COLORS or color2 not in ALL_COLORS:
+                print(f"Skipping {image_path}: Invalid colors {color1}, {color2}")
+                continue
+            
+            for fruit_idx, target_fruit in enumerate([fruit1, fruit2]):
+                classification_idx = i * 2 + fruit_idx
+                fname = osp.join(self.run_folder, formatstr.format(classification_idx) + '.pt')
+                
+                if os.path.exists(fname):
+                    print(f'Skipping classification {classification_idx}')
+                    if self.args.load_stats:
+                        data = torch.load(fname)
+                        prediction_type = data['prediction_type']
+                        if prediction_type == 'correct':
+                            self.correct_predictions += 1
+                        elif prediction_type == 'other_fruit':
+                            self.other_fruit_predictions += 1
+                        else:
+                            self.other_mistakes += 1
+                        self.total_classifications += 1
+                    continue
+                
+                # Get the target color and other fruit color from the filename
+                target_color = colors[target_fruit]
+                other_fruit = fruit2 if target_fruit == fruit1 else fruit1
+                other_fruit_color = colors[other_fruit]
+                
+                predicted_color, correct_color, prediction_type, prompts, pred_idx = self.perform_color_classification_compound_unnatural(
+                    image, fruit1, fruit2, target_fruit, target_color, other_fruit_color
+                )
+                
+                if prediction_type == 'correct':
+                    self.correct_predictions += 1
+                elif prediction_type == 'other_fruit':
+                    self.other_fruit_predictions += 1
+                else:
+                    self.other_mistakes += 1
+                
+                self.total_classifications += 1
+                
+                torch.save(dict(
+                    predicted_color=predicted_color,
+                    correct_color=correct_color,
+                    prediction_type=prediction_type,
+                    pred_idx=pred_idx,
+                    target_fruit=target_fruit,
+                    target_color=target_color,
+                    fruits=[fruit1, fruit2],
+                    colors=colors,
                     prompts=prompts,
                     image_path=image_path,
                     classification_idx=classification_idx
@@ -819,28 +1012,109 @@ class DiffusionEvaluator:
                 classification_idx=i
             ), fname)
 
+
+    def run_evaluation_single_unnatural(self):
+        """Run evaluation for single unnatural images"""
+        idxs_to_eval = list(range(len(self.target_dataset)))
+        
+        formatstr = get_formatstr(len(self.target_dataset) - 1)
+        pbar = tqdm.tqdm(idxs_to_eval)
+        
+        for i in pbar:
+            if self.total_classifications > 0:
+                correct_acc = 100 * self.correct_predictions / self.total_classifications
+                pbar.set_description(f'Correct: {correct_acc:.2f}% ({self.correct_predictions}/{self.total_classifications})')
+            
+            image, fruits, color, image_path = self.target_dataset[i]
+            
+            if len(fruits) != 1:
+                print(f"Skipping {image_path}: Expected 1 fruit, got {len(fruits)}")
+                continue
+            
+            if color is None or color not in ALL_COLORS:
+                print(f"Skipping {image_path}: Invalid or missing color in filename")
+                continue
+                
+            fruit = fruits[0]
+            
+            fname = osp.join(self.run_folder, formatstr.format(i) + '.pt')
+            
+            if os.path.exists(fname):
+                print(f'Skipping classification {i}')
+                if self.args.load_stats:
+                    data = torch.load(fname)
+                    prediction_type = data['prediction_type']
+                    predicted_color = data['predicted_color']
+                    correct_color = data['correct_color']
+                    
+                    # Update confusion matrix
+                    true_idx = self.color_to_idx[correct_color]
+                    pred_idx = self.color_to_idx[predicted_color]
+                    self.confusion_matrix[true_idx, pred_idx] += 1
+                    
+                    if prediction_type == 'correct':
+                        self.correct_predictions += 1
+                    else:
+                        self.other_mistakes += 1
+                    self.total_classifications += 1
+                continue
+            
+            predicted_color, correct_color, prediction_type, prompts, pred_idx = self.perform_color_classification_single_unnatural(
+                image, fruit, color
+            )
+            
+            # Update confusion matrix
+            true_idx = self.color_to_idx[correct_color]
+            pred_idx_cm = self.color_to_idx[predicted_color]
+            self.confusion_matrix[true_idx, pred_idx_cm] += 1
+            
+            if prediction_type == 'correct':
+                self.correct_predictions += 1
+            else:
+                self.other_mistakes += 1
+            
+            self.total_classifications += 1
+            
+            torch.save(dict(
+                predicted_color=predicted_color,
+                correct_color=correct_color,
+                prediction_type=prediction_type,
+                pred_idx=pred_idx,
+                target_fruit=fruit,
+                target_color=color,
+                fruits=[fruit],
+                prompts=prompts,
+                image_path=image_path,
+                classification_idx=i
+            ), fname)
+
+
     def run_evaluation(self):
         """Run evaluation based on mode"""
         if self.args.mode == 'compound':
             self.run_evaluation_compound()
+        elif self.args.mode == 'compound_unnatural':
+            self.run_evaluation_compound_unnatural()
+        elif self.args.mode == 'single_unnatural':
+            self.run_evaluation_single_unnatural()
         else:
             self.run_evaluation_single()
         
         # Generate summary
         self.save_results_summary()
         
-        # Save confusion matrix for single mode
-        if self.args.mode == 'single':
+        # Save confusion matrix for single and single_unnatural modes
+        if self.args.mode in ['single', 'single_unnatural']:
             self.save_confusion_matrix()
         
         # Print final results
         if self.total_classifications > 0:
             correct_acc = 100 * self.correct_predictions / self.total_classifications
-            print(f"\nFinal Color Classification Results ({self.args.mode.title()} Mode, Weighted):")
+            print(f"\nFinal Color Classification Results ({self.args.mode.title()} Mode):")
             print(f"Total classifications: {self.total_classifications}")
             print(f"Correct color predictions: {self.correct_predictions} ({correct_acc:.2f}%)")
             
-            if self.args.mode == 'compound':
+            if self.args.mode in ['compound', 'compound_unnatural']:
                 other_fruit_acc = 100 * self.other_fruit_predictions / self.total_classifications
                 other_mistakes_acc = 100 * self.other_mistakes / self.total_classifications
                 print(f"Other fruit color predictions: {self.other_fruit_predictions} ({other_fruit_acc:.2f}%)")
@@ -850,20 +1124,23 @@ class DiffusionEvaluator:
                 print(f"Incorrect predictions: {self.other_mistakes} ({incorrect_acc:.2f}%)")
 
 
+
 def main():
     parser = argparse.ArgumentParser()
 
     # dataset args
     parser.add_argument('--cab_folder', type=str,
-                        default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/CAB',
-                        help='Path to CAB folder containing fruit_combinations and single_images folders')
-    parser.add_argument('--mode', type=str, default='compound', choices=['compound', 'single'],
-                        help='Mode: compound for two-fruit images, single for single-fruit images')
+                        default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/color',
+                        help='Path to color folder')
+    parser.add_argument('--mode', type=str, default='single', 
+                        choices=['compound', 'single', 'compound_unnatural', 'single_unnatural'],
+                        help='Mode: compound for two-fruit images, single for single-fruit images, ' + 
+                            'compound_unnatural for unnatural color combinations, single_unnatural for single unnatural fruits')
     
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
-    parser.add_argument('--batch_size', '-b', type=int, default=32)
+    parser.add_argument('--batch_size', '-b', type=int, default=1, help='Batch size')
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
@@ -875,9 +1152,9 @@ def main():
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', default=[1], type=int)
-    parser.add_argument('--n_samples', nargs='+', default=[50], type=int)
+    parser.add_argument('--n_samples', nargs='+', default=[5], type=int)
 
-    parser.add_argument('--visualize', action='store_true', default=False, help='Visualize error heatmaps during evaluation')
+    parser.add_argument('--visualize', action='store_true', default=True, help='Visualize error heatmaps during evaluation')
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
