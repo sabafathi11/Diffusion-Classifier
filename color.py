@@ -211,6 +211,53 @@ class CABDataset:
             return image, fruits, image_path
 
 
+class AttentionExtractor:
+    """Hook-based attention extraction from UNet"""
+    def __init__(self):
+        self.attention_maps = []
+        self.hooks = []
+        
+    def get_attention_hook(self, name):
+        """Create hook function for attention extraction"""
+        def hook(module, input, output):
+            # Store attention maps from cross-attention layers
+            if hasattr(module, 'attn'):
+                # output is typically (batch_size, seq_len, dim)
+                self.attention_maps.append({
+                    'name': name,
+                    'attention': output.detach().cpu()
+                })
+        return hook
+    
+    def register_hooks(self, unet):
+        """Register hooks to all attention layers in UNet"""
+        self.remove_hooks()
+        self.attention_maps = []
+        
+        # Register hooks on attention layers
+        for name, module in unet.named_modules():
+            # Look for cross-attention or self-attention layers
+            if 'attn' in name.lower() and ('cross' in name.lower() or 'self' in name.lower()):
+                hook = module.register_forward_hook(self.get_attention_hook(name))
+                self.hooks.append(hook)
+        
+        print(f"Registered {len(self.hooks)} attention hooks")
+    
+    def remove_hooks(self):
+        """Remove all registered hooks"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+    
+    def get_attention_maps(self):
+        """Return collected attention maps"""
+        return self.attention_maps
+    
+    def clear_attention_maps(self):
+        """Clear stored attention maps"""
+        self.attention_maps = []
+
+
 class DiffusionEvaluator:
     def __init__(self, args):
         self.args = args
@@ -227,6 +274,9 @@ class DiffusionEvaluator:
             self.confusion_matrix = np.zeros((len(ALL_COLORS), len(ALL_COLORS)), dtype=int)
             self.color_to_idx = {color: idx for idx, color in enumerate(ALL_COLORS)}
         
+        # Initialize attention extractor
+        self.attention_extractor = AttentionExtractor() if args.visualize_attention else None
+        
         self._setup_models()
         self._setup_dataset()
         self._setup_noise()
@@ -238,6 +288,10 @@ class DiffusionEvaluator:
         self.text_encoder = self.text_encoder.to(self.device)
         self.unet = self.unet.to(self.device)
         torch.backends.cudnn.benchmark = True
+        
+        # Register attention hooks if needed
+        if self.args.visualize_attention:
+            self.attention_extractor.register_hooks(self.unet)
         
     def _setup_dataset(self):
         interpolation = INTERPOLATIONS[self.args.interpolation]
@@ -265,6 +319,8 @@ class DiffusionEvaluator:
             name += '_huber'
         if self.args.img_size != 512:
             name += f'_{self.args.img_size}'
+        if self.args.visualize_attention:
+            name += '_attn'
         if self.args.extra is not None:
             self.run_folder = osp.join(LOG_DIR, 'CAB_' + self.args.extra, name)
         else:
@@ -288,6 +344,109 @@ class DiffusionEvaluator:
             return 'other_fruit'
         else:
             return 'other_mistake'
+
+    def aggregate_attention_maps(self, attention_maps, target_size=(64, 64)):
+        """
+        Aggregate attention maps across all layers and heads.
+        
+        Args:
+            attention_maps: List of attention dictionaries from hooks
+            target_size: Target spatial size for visualization
+            
+        Returns:
+            Aggregated attention map as numpy array
+        """
+        if not attention_maps:
+            return None
+        
+        aggregated = []
+        
+        for attn_dict in attention_maps:
+            attn = attn_dict['attention']
+            
+            # Handle different attention map shapes
+            # Typical shapes: (batch, heads, seq_len, seq_len) or (batch, seq_len, dim)
+            if len(attn.shape) == 4:  # (batch, heads, seq_len, seq_len)
+                # Average over heads and batch
+                attn = attn.mean(dim=(0, 1))  # (seq_len, seq_len)
+                # Take mean over query dimension to get attention per token
+                attn = attn.mean(dim=0)  # (seq_len,)
+            elif len(attn.shape) == 3:  # (batch, seq_len, dim)
+                # Average over batch and dim
+                attn = attn.mean(dim=(0, 2))  # (seq_len,)
+            
+            # Convert to spatial map if needed
+            seq_len = attn.shape[0]
+            spatial_size = int(np.sqrt(seq_len))
+            
+            if spatial_size * spatial_size == seq_len:
+                attn_map = attn.reshape(spatial_size, spatial_size)
+                # Resize to target size
+                attn_map = torch.tensor(attn_map).unsqueeze(0).unsqueeze(0)
+                attn_map = F.interpolate(attn_map, size=target_size, mode='bilinear', align_corners=False)
+                attn_map = attn_map.squeeze().numpy()
+                aggregated.append(attn_map)
+        
+        if aggregated:
+            # Average all attention maps
+            return np.mean(aggregated, axis=0)
+        
+        return None
+
+    def visualize_attention_overlay(self, original_image, attention_map, target_fruit, 
+                                   prompt_text, timestep, save_path=None):
+        """
+        Visualize attention map overlaid on original image.
+        
+        Args:
+            original_image: Original image tensor (C, H, W)
+            attention_map: Aggregated attention map (H, W)
+            target_fruit: Name of target fruit
+            prompt_text: The prompt text
+            timestep: Denoising timestep
+            save_path: Path to save the visualization
+        """
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Convert original image to numpy
+        orig_img = ((original_image.cpu().numpy().transpose(1, 2, 0) + 1) / 2).clip(0, 1)
+        
+        # Original image
+        axes[0].imshow(orig_img)
+        axes[0].set_title(f'Original Image: {target_fruit}', fontsize=12, fontweight='bold')
+        axes[0].axis('off')
+        
+        # Attention map
+        im1 = axes[1].imshow(attention_map, cmap='hot', interpolation='bilinear')
+        axes[1].set_title(f'Attention Map\nt={timestep}', fontsize=12, fontweight='bold')
+        axes[1].axis('off')
+        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        
+        # Overlay
+        axes[2].imshow(orig_img)
+        # Resize attention map to match image size
+        attn_resized = F.interpolate(
+            torch.tensor(attention_map).unsqueeze(0).unsqueeze(0),
+            size=(orig_img.shape[0], orig_img.shape[1]),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze().numpy()
+        
+        im2 = axes[2].imshow(attn_resized, cmap='hot', alpha=0.5, interpolation='bilinear')
+        axes[2].set_title(f'Attention Overlay\nPrompt: "{prompt_text}"', fontsize=12, fontweight='bold')
+        axes[2].axis('off')
+        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+        
+        plt.suptitle(f'Cross-Attention Visualization for {target_fruit}', 
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Attention visualization saved to {save_path}")
+            plt.close()
+        
+        return fig
 
     def eval_error(self, unet, scheduler, latent, all_noise, ts, noise_idxs,
                    text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2', T=1000):
@@ -336,6 +495,10 @@ class DiffusionEvaluator:
             if visualize:
                 viz_data = defaultdict(lambda: {'images': [], 'errors': [], 'timesteps': []})
             
+            # Store attention data if needed
+            if self.args.visualize_attention:
+                attention_data = defaultdict(lambda: {'attention_maps': [], 'timesteps': []})
+            
             with torch.inference_mode():
                 for batch_idx in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
                     batch_ts = torch.tensor(ts[idx: idx + batch_size])
@@ -356,8 +519,16 @@ class DiffusionEvaluator:
                         text_input = text_input.half()
                         noised_latent = noised_latent.half()
                     
+                    # Clear attention maps before forward pass
+                    if self.args.visualize_attention:
+                        self.attention_extractor.clear_attention_maps()
+                    
                     # Predict noise
                     noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
+                    
+                    # Collect attention maps
+                    if self.args.visualize_attention:
+                        current_attention_maps = self.attention_extractor.get_attention_maps()
                     
                     # Denoise to get predicted clean latent
                     denoised_latent = (noised_latent - sqrt_one_minus_alpha_prod * noise_pred) / sqrt_alpha_prod
@@ -389,6 +560,13 @@ class DiffusionEvaluator:
                             viz_data[prompt_idx]['errors'].append(error[i].detach().cpu())
                             viz_data[prompt_idx]['timesteps'].append(batch_ts[i].item())
                     
+                    # Store attention data
+                    if self.args.visualize_attention:
+                        for i in range(len(batch_ts)):
+                            prompt_idx = batch_text_idxs[i]
+                            attention_data[prompt_idx]['attention_maps'].append(current_attention_maps)
+                            attention_data[prompt_idx]['timesteps'].append(batch_ts[i].item())
+                    
                     idx += len(batch_ts)
             
             # Create visualizations for all prompts
@@ -408,6 +586,34 @@ class DiffusionEvaluator:
                         original_image, target_fruit, recon_images, error_maps, 
                         timesteps, prompt_text, save_path=save_path
                     )
+            
+            # Create attention visualizations
+            if self.args.visualize_attention and len(attention_data) > 0:
+                timestamp = datetime.now().strftime("%H%M%S")
+                
+                for prompt_idx, data in attention_data.items():
+                    prompt_text = prompts[prompt_idx] if prompts is not None else f"Prompt {prompt_idx}"
+                    
+                    # Visualize attention for a subset of timesteps (e.g., every 5th)
+                    for i in range(0, len(data['timesteps']), 5):
+                        attn_maps = data['attention_maps'][i]
+                        timestep = data['timesteps'][i]
+                        
+                        # Aggregate attention maps
+                        aggregated_attn = self.aggregate_attention_maps(
+                            attn_maps, 
+                            target_size=(self.latent_size, self.latent_size)
+                        )
+                        
+                        if aggregated_attn is not None:
+                            save_path = osp.join(
+                                self.run_folder, 
+                                f'attention_prompt{prompt_idx}_t{timestep}_{timestamp}.png'
+                            )
+                            self.visualize_attention_overlay(
+                                original_image[0], aggregated_attn, target_fruit,
+                                prompt_text, timestep, save_path=save_path
+                            )
             
             return pred_errors
 
@@ -782,6 +988,7 @@ class DiffusionEvaluator:
             f.write(f"Loss function: {self.args.loss}\n")
             f.write(f"Data type: {self.args.dtype}\n")
             f.write(f"Interpolation: {self.args.interpolation}\n")
+            f.write(f"Visualize attention: {self.args.visualize_attention}\n")
             f.write(f"Adaptive sampling - n_samples: {self.args.n_samples}\n")
             f.write(f"Adaptive sampling - to_keep: {self.args.to_keep}\n\n")
             
@@ -1155,6 +1362,7 @@ def main():
     parser.add_argument('--n_samples', nargs='+', default=[5], type=int)
 
     parser.add_argument('--visualize', action='store_true', default=True, help='Visualize error heatmaps during evaluation')
+    parser.add_argument('--visualize_attention', action='store_true', default=True, help='Visualize attention maps during evaluation')
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
