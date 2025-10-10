@@ -17,6 +17,7 @@ import seaborn as sns
 from sklearn.metrics import confusion_matrix, classification_report
 from transformers import AutoModelForImageSegmentation
 from PIL import Image
+from datetime import datetime
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -198,6 +199,8 @@ class DiffusionEvaluator:
             name += f'_{self.args.samples_per_class}spc'
         if self.args.remove_background:
             name += '_nobg'
+        if self.args.visualize:
+            name += '_viz'
         if self.args.extra is not None:
             self.run_folder = osp.join(LOG_DIR, self.args.dataset + '_' + self.args.extra, name)
         else:
@@ -233,62 +236,270 @@ class DiffusionEvaluator:
         image_tensor_out = torch_transforms.Normalize([0.5], [0.5])(image_tensor_out)
         
         return image_tensor_out
-    
-    def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, latent_size=64, all_noise=None):
-        scheduler_config = get_scheduler_config(args)
-        T = scheduler_config['num_train_timesteps']
-        max_n_samples = max(args.n_samples)
 
-        if all_noise is None:
-            all_noise = torch.randn((max_n_samples * args.n_trials, 4, latent_size, latent_size), device=latent.device)
-        if args.dtype == 'float16':
-            all_noise = all_noise.half()
-            scheduler.alphas_cumprod = scheduler.alphas_cumprod.half()
+    def visualize_error_heatmap(self, original_image, true_label, reconstructed_images, 
+                            error_maps, timesteps, prompt_text, save_path=None):
+        """
+        Visualize original image, reconstructed images, and error heatmaps for all timesteps.
 
-        data = dict()
-        t_evaluated = set()
-        remaining_prmpt_idxs = list(range(len(text_embeds)))
-        start = T // max_n_samples // 2
-        t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
-
-        for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
-            ts = []
-            noise_idxs = []
-            text_embed_idxs = []
-            curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
-            curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
-            for prompt_i in remaining_prmpt_idxs:
-                for t_idx, t in enumerate(curr_t_to_eval, start=len(t_evaluated)):
-                    ts.extend([t] * args.n_trials)
-                    noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
-                    text_embed_idxs.extend([prompt_i] * args.n_trials)
-            t_evaluated.update(curr_t_to_eval)
-            pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss)
-            
-            for prompt_i in remaining_prmpt_idxs:
-                mask = torch.tensor(text_embed_idxs) == prompt_i
-                prompt_ts = torch.tensor(ts)[mask]
-                prompt_pred_errors = pred_errors[mask]
-                if prompt_i not in data:
-                    data[prompt_i] = dict(t=prompt_ts, pred_errors=prompt_pred_errors)
-                else:
-                    data[prompt_i]['t'] = torch.cat([data[prompt_i]['t'], prompt_ts])
-                    data[prompt_i]['pred_errors'] = torch.cat([data[prompt_i]['pred_errors'], prompt_pred_errors])
-
-            errors = [-data[prompt_i]['pred_errors'].mean() for prompt_i in remaining_prmpt_idxs]
-            best_idxs = torch.topk(torch.tensor(errors), k=n_to_keep, dim=0).indices.tolist()
-            remaining_prmpt_idxs = [remaining_prmpt_idxs[i] for i in best_idxs]
-
-        assert len(remaining_prmpt_idxs) == 1
-        pred_idx = remaining_prmpt_idxs[0]
+        Args:
+            original_image: Original image tensor (B, C, H, W)
+            true_label: True class label
+            reconstructed_images: Reconstructed images tensor (N, C, H, W) - all timesteps
+            error_maps: Error maps tensor (N, H, W)
+            timesteps: Timesteps for each image (N,)
+            prompt_text: The prompt text being evaluated
+            save_path: Path to save the figure
+        """
+        num_samples = len(reconstructed_images)
         
-        all_losses = torch.zeros(len(text_embeds))
-        for prompt_i in data:
-            all_losses[prompt_i] = data[prompt_i]['pred_errors'].mean()
-
-        return all_losses, pred_idx, data
-
+        # Sort by timestep for better visualization
+        sort_idx = torch.argsort(timesteps)
+        timesteps = timesteps[sort_idx]
+        reconstructed_images = reconstructed_images[sort_idx]
+        error_maps = error_maps[sort_idx]
+        
+        # Determine grid layout
+        max_cols = 6  # Maximum images per row
+        num_rows = (num_samples + max_cols - 1) // max_cols
+        num_cols = min(num_samples, max_cols)
+        
+        fig = plt.figure(figsize=(5 * num_cols, 10 * num_rows))
+        gs = fig.add_gridspec(num_rows + 1, num_cols, hspace=0.3, wspace=0.3)
+        
+        # Convert original image to numpy and normalize to [0, 1]
+        orig_img = ((original_image[0].cpu().numpy().transpose(1, 2, 0) + 1) / 2).clip(0, 1).astype(np.float32)
+        
+        # Get class name
+        class_name = self.classidx_to_name.get(true_label, str(true_label))
+        
+        # Plot original image spanning first row
+        ax_orig = fig.add_subplot(gs[0, :])
+        ax_orig.imshow(orig_img)
+        ax_orig.set_title(f'Original Image: {class_name}\nPrompt: "{prompt_text}"', 
+                        fontsize=12, fontweight='bold')
+        ax_orig.axis('off')
+        
+        # Plot reconstructed images and error maps
+        for i in range(num_samples):
+            row = (i // num_cols) + 1
+            col = i % num_cols
+            
+            # Create subplot with 2 rows for this position
+            ax = fig.add_subplot(gs[row, col])
+            
+            recon_img = ((reconstructed_images[i].cpu().numpy().transpose(1, 2, 0) + 1) / 2).clip(0, 1).astype(np.float32)
+            error_map = error_maps[i].cpu().numpy().astype(np.float32)
+            
+            # Create combined visualization: reconstructed on top, error heatmap on bottom
+            ax.clear()
+            
+            # Show reconstructed image
+            ax.imshow(recon_img, extent=[0, 1, 0.5, 1])
+            
+            # Show error heatmap
+            im = ax.imshow(error_map, cmap='hot', interpolation='nearest', 
+                        extent=[0, 1, 0, 0.5], aspect='auto')
+            
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_title(f't={timesteps[i].item()}\nAvg Error: {error_map.mean():.4f}', 
+                        fontsize=10)
+            ax.axis('off')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.ax.tick_params(labelsize=8)
+        
+        plt.suptitle(f'Reconstruction Error Analysis Across Timesteps\nTrue Class: {class_name}', 
+                    fontsize=14, fontweight='bold', y=0.995)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Visualization saved to {save_path}")
+            plt.close()
+        else:
+            plt.show()
+        
+        return fig
+    
+    def eval_error_visualize(self, unet, scheduler, vae, original_image, latent, all_noise, ts, noise_idxs,
+                text_embeds, text_embed_idxs, true_label, batch_size=32, dtype='float32', loss='l2', T=1000,
+                visualize=False, prompts=None):
+        """
+        Evaluate denoising error with FULL denoising trajectory from noisy to clean image.
+        Uses the scheduler's proper step() method for correct denoising.
+        
+        Args:
+            prompts: List of prompt strings corresponding to text_embeds (needed for visualization titles)
+        """
+        assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
+        pred_errors = torch.zeros(len(ts), device='cpu')
+        idx = 0
+        
+        # Store data for visualization - organized by prompt
+        if visualize:
+            viz_data = defaultdict(lambda: {'images': [], 'errors': [], 'timesteps': []})
+        
+        with torch.inference_mode():
+            for batch_idx in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
+                batch_ts = torch.tensor(ts[idx: idx + batch_size])
+                batch_text_idxs = text_embed_idxs[idx: idx + batch_size]
+                noise = all_noise[noise_idxs[idx: idx + batch_size]]
+                
+                # Create initial noised latent at timestep t
+                alpha_prod_t = scheduler.alphas_cumprod[batch_ts]
+                sqrt_alpha_prod = (alpha_prod_t ** 0.5).view(-1, 1, 1, 1).to(self.device)
+                sqrt_one_minus_alpha_prod = ((1 - alpha_prod_t) ** 0.5).view(-1, 1, 1, 1).to(self.device)
+                
+                noised_latent = latent * sqrt_alpha_prod + noise * sqrt_one_minus_alpha_prod
+                
+                # Prepare text embeddings
+                text_input = text_embeds[batch_text_idxs]
+                if dtype == 'float16':
+                    text_input = text_input.half()
+                    noised_latent = noised_latent.half()
+                
+                # ===== FULL DENOISING LOOP =====
+                # For each sample in batch, denoise from timestep t down to 0
+                batch_reconstructed = []
+                
+                for sample_idx in range(len(batch_ts)):
+                    current_t = batch_ts[sample_idx].item()
+                    current_latent = noised_latent[sample_idx:sample_idx+1].clone()
+                    current_text = text_input[sample_idx:sample_idx+1]
+                    
+                    # Create a temporary scheduler instance for this sample
+                    # to avoid modifying the shared scheduler
+                    from diffusers import EulerDiscreteScheduler
+                    temp_scheduler = EulerDiscreteScheduler.from_config(scheduler.config)
+                    
+                    # Set the number of inference steps based on starting timestep
+                    # Use fewer steps for later timesteps, more for earlier
+                    num_inference_steps = max(20, current_t // 20)  # Adaptive step count
+                    temp_scheduler.set_timesteps(num_inference_steps, device=self.device)
+                    
+                    # Find the closest timestep in the scheduler's timesteps to current_t
+                    timesteps = temp_scheduler.timesteps
+                    start_idx = 0
+                    for i, t in enumerate(timesteps):
+                        if t <= current_t:
+                            start_idx = i
+                            break
+                    
+                    # Use only timesteps from current_t down to 0
+                    denoising_timesteps = timesteps[start_idx:]
+                    
+                    # If we need to start exactly at current_t and it's not in the schedule,
+                    # we need to rescale the latent to match the closest timestep
+                    if len(denoising_timesteps) > 0:
+                        actual_start_t = int(denoising_timesteps[0].item())
+                        
+                        # If there's a mismatch, rescale the noisy latent
+                        if actual_start_t != current_t:
+                            # Rescale from current_t noise level to actual_start_t noise level
+                            alpha_curr = scheduler.alphas_cumprod[int(current_t)]
+                            alpha_start = scheduler.alphas_cumprod[actual_start_t]
+                            
+                            # Extract the signal and noise components
+                            signal_coeff = (alpha_curr ** 0.5)
+                            noise_coeff = ((1 - alpha_curr) ** 0.5)
+                            
+                            # Rescale to new noise level
+                            signal_coeff_new = (alpha_start ** 0.5)
+                            noise_coeff_new = ((1 - alpha_start) ** 0.5)
+                            
+                            current_latent = current_latent * (signal_coeff_new / signal_coeff)
+                    else:
+                        # No timesteps available, just decode as-is
+                        batch_reconstructed.append(current_latent)
+                        continue
+                    
+                    # Denoise iteratively using scheduler.step()
+                    for t in denoising_timesteps:
+                        t_tensor = t.unsqueeze(0) if t.dim() == 0 else t
+                        
+                        # Predict noise
+                        if dtype == 'float16':
+                            latent_model_input = current_latent.half()
+                            t_input = t_tensor.half()
+                        else:
+                            latent_model_input = current_latent
+                            t_input = t_tensor
+                        
+                        # Scale input according to scheduler rules
+                        latent_model_input = temp_scheduler.scale_model_input(current_latent, t)
+                        
+                        noise_pred = unet(
+                            latent_model_input, 
+                            t_input, 
+                            encoder_hidden_states=current_text
+                        ).sample
+                        
+                        # Use scheduler's step method for proper denoising
+                        step_output = temp_scheduler.step(
+                            noise_pred, 
+                            t, 
+                            current_latent,
+                            return_dict=True
+                        )
+                        
+                        current_latent = step_output.prev_sample
+                    
+                    batch_reconstructed.append(current_latent)
+                
+                # Stack all reconstructed latents
+                fully_denoised_latent = torch.cat(batch_reconstructed, dim=0)
+                
+                # Decode to pixel space
+                if dtype == 'float16':
+                    fully_denoised_latent = fully_denoised_latent.half()
+                
+                reconstructed_image = vae.decode(fully_denoised_latent / vae.config.scaling_factor).sample
+                
+                # Compute error in pixel space
+                if loss == 'l2':
+                    error = F.mse_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                elif loss == 'l1':
+                    error = F.l1_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                elif loss == 'huber':
+                    error = F.huber_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                else:
+                    raise NotImplementedError
+                
+                # Average over spatial dimensions for the metric
+                pred_errors[idx: idx + len(batch_ts)] = error.mean(dim=(1, 2)).detach().cpu()
+                
+                # Store samples for visualization - group by prompt
+                if visualize:
+                    for i in range(len(batch_ts)):
+                        prompt_idx = batch_text_idxs[i]
+                        viz_data[prompt_idx]['images'].append(reconstructed_image[i].detach().cpu())
+                        viz_data[prompt_idx]['errors'].append(error[i].detach().cpu())
+                        viz_data[prompt_idx]['timesteps'].append(batch_ts[i].item())
+                
+                idx += len(batch_ts)
+        
+        # Create visualizations for all prompts
+        if visualize and len(viz_data) > 0:
+            timestamp = datetime.now().strftime("%H%M%S")
+            
+            for prompt_idx, data in viz_data.items():
+                prompt_text = prompts[prompt_idx] if prompts is not None else f"Prompt {prompt_idx}"
+                
+                # Convert lists to tensors
+                recon_images = torch.stack(data['images'])
+                error_maps = torch.stack(data['errors'])
+                timesteps = torch.tensor(data['timesteps'])
+                
+                save_path = osp.join(self.run_folder, f'error_heatmap_prompt{prompt_idx}_{timestamp}.png')
+                self.visualize_error_heatmap(
+                    original_image, true_label, recon_images, error_maps, 
+                    timesteps, prompt_text, save_path=save_path
+                )
+        
+        return pred_errors
+        
     def eval_error(self, unet, scheduler, latent, all_noise, ts, noise_idxs,
                    text_embeds, text_embed_idxs, batch_size=32, dtype='float32', loss='l2'):
         assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
@@ -317,6 +528,77 @@ class DiffusionEvaluator:
                 pred_errors[idx: idx + len(batch_ts)] = error.detach().cpu()
                 idx += len(batch_ts)
         return pred_errors
+
+    def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, original_image, true_label,
+                        latent_size=64, all_noise=None, prompts=None):
+        """
+        Args:
+            original_image: Original image tensor for visualization
+            true_label: True class label
+            prompts: List of prompt strings for visualization titles
+        """
+        scheduler_config = get_scheduler_config(args)
+        T = scheduler_config['num_train_timesteps']
+        max_n_samples = max(args.n_samples)
+
+        if all_noise is None:
+            all_noise = torch.randn((max_n_samples * args.n_trials, 4, latent_size, latent_size), device=latent.device)
+        if args.dtype == 'float16':
+            all_noise = all_noise.half()
+            scheduler.alphas_cumprod = scheduler.alphas_cumprod.half()
+
+        data = dict()
+        t_evaluated = set()
+        remaining_prmpt_idxs = list(range(len(text_embeds)))
+        start = T // max_n_samples // 2
+        t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
+
+        for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
+            ts = []
+            noise_idxs = []
+            text_embed_idxs = []
+            curr_t_to_eval = t_to_eval[len(t_to_eval) // n_samples // 2::len(t_to_eval) // n_samples][:n_samples]
+            curr_t_to_eval = [t for t in curr_t_to_eval if t not in t_evaluated]
+            for prompt_i in remaining_prmpt_idxs:
+                for t_idx, t in enumerate(curr_t_to_eval, start=len(t_evaluated)):
+                    ts.extend([t] * args.n_trials)
+                    noise_idxs.extend(list(range(args.n_trials * t_idx, args.n_trials * (t_idx + 1))))
+                    text_embed_idxs.extend([prompt_i] * args.n_trials)
+            t_evaluated.update(curr_t_to_eval)
+            
+            # Use visualization version if requested
+            if args.visualize:
+                pred_errors = self.eval_error_visualize(
+                    unet, scheduler, self.vae, original_image, latent, all_noise, ts, noise_idxs,
+                    text_embeds, text_embed_idxs, true_label, args.batch_size, args.dtype, 
+                    args.loss, T, visualize=True, prompts=prompts
+                )
+            else:
+                pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
+                                     text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss)
+            
+            for prompt_i in remaining_prmpt_idxs:
+                mask = torch.tensor(text_embed_idxs) == prompt_i
+                prompt_ts = torch.tensor(ts)[mask]
+                prompt_pred_errors = pred_errors[mask]
+                if prompt_i not in data:
+                    data[prompt_i] = dict(t=prompt_ts, pred_errors=prompt_pred_errors)
+                else:
+                    data[prompt_i]['t'] = torch.cat([data[prompt_i]['t'], prompt_ts])
+                    data[prompt_i]['pred_errors'] = torch.cat([data[prompt_i]['pred_errors'], prompt_pred_errors])
+
+            errors = [-data[prompt_i]['pred_errors'].mean() for prompt_i in remaining_prmpt_idxs]
+            best_idxs = torch.topk(torch.tensor(errors), k=n_to_keep, dim=0).indices.tolist()
+            remaining_prmpt_idxs = [remaining_prmpt_idxs[i] for i in best_idxs]
+
+        assert len(remaining_prmpt_idxs) == 1
+        pred_idx = remaining_prmpt_idxs[0]
+        
+        all_losses = torch.zeros(len(text_embeds))
+        for prompt_i in data:
+            all_losses[prompt_i] = data[prompt_i]['pred_errors'].mean()
+
+        return all_losses, pred_idx, data
 
     def plot_confusion_matrix(self, save_path=None):
         """Generate and save confusion matrix plot."""
@@ -378,6 +660,7 @@ class DiffusionEvaluator:
             f.write(f"Version: {self.args.version}\n")
             f.write(f"Image size: {self.args.img_size}\n")
             f.write(f"Background removal: {self.args.remove_background}\n")
+            f.write(f"Visualization enabled: {self.args.visualize}\n")
             f.write(f"Batch size: {self.args.batch_size}\n")
             f.write(f"Number of trials: {self.args.n_trials}\n")
             f.write(f"Loss function: {self.args.loss}\n")
@@ -445,10 +728,14 @@ class DiffusionEvaluator:
                 x0 *= 0.18215
 
             text_embeddings_to_use = self.text_embeddings
+            
+            # Get prompts for this evaluation
+            prompts = self.prompts_df.prompt.tolist()
                 
             _, pred_idx, pred_errors = self.eval_prob_adaptive(
                 self.unet, x0, text_embeddings_to_use, self.scheduler, 
-                self.args, self.latent_size, self.all_noise
+                self.args, img_input, label, self.latent_size, self.all_noise,
+                prompts=prompts
             )
             
             pred = self.prompts_df.classidx[pred_idx]
@@ -477,12 +764,12 @@ def main():
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
-    parser.add_argument('--batch_size', '-b', type=int, default=32)
+    parser.add_argument('--batch_size', '-b', type=int, default=1)
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
     parser.add_argument('--prompt_path', type=str, default='prompts/pets_prompts.csv', help='Path to csv file with prompts to use')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
-    parser.add_argument('--samples_per_class', type=int, default=10, help='Number of samples per class for balanced subset')
+    parser.add_argument('--samples_per_class', type=int, default=1, help='Number of samples per class for balanced subset')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
                         help='Model data type to use')
     parser.add_argument('--interpolation', type=str, default='bicubic', help='Resize interpolation type')
@@ -491,11 +778,12 @@ def main():
     parser.add_argument('--worker_idx', type=int, default=0, help='Index of worker to use')
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
     parser.add_argument('--loss', type=str, default='l1', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
-    parser.add_argument('--remove_background', action='store_true', default=True, help='Remove background using BiRefNet before classification')
+    parser.add_argument('--remove_background', action='store_true', default=False, help='Remove background using BiRefNet before classification')
+    parser.add_argument('--visualize', action='store_true', default=True, help='Visualize error heatmaps during evaluation')
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', type=int, default=[1])
-    parser.add_argument('--n_samples', nargs='+', type=int, default=[50])
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[10])
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
