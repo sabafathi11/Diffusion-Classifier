@@ -44,6 +44,10 @@ def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
         torch_transforms.Resize(size, interpolation=interpolation),
         torch_transforms.CenterCrop(size),
         _convert_image_to_rgb,
+        torch_transforms.Lambda(lambda img: torch_transforms.functional.adjust_hue(img, -0.5)),  # Major color shift
+        torch_transforms.Lambda(lambda img: torch_transforms.functional.adjust_saturation(img, 2.5)),  # Hyper-saturated
+        torch_transforms.Lambda(lambda img: torch_transforms.functional.adjust_contrast(img, 1.8)),  # Punchy contrast
+        torch_transforms.Lambda(lambda img: torch_transforms.functional.adjust_brightness(img, 1)),  # Slight brightness boost
         torch_transforms.ToTensor(),
         torch_transforms.Normalize([0.5], [0.5])
     ])
@@ -672,7 +676,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # dataset args
-    parser.add_argument('--dataset', type=str, default='pets',
+    parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
                                  'objectnet', 'aircraft'], help='Dataset to use')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
@@ -680,12 +684,12 @@ def main():
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
-    parser.add_argument('--batch_size', '-b', type=int, default=1)
+    parser.add_argument('--batch_size', '-b', type=int, default=32, help='Batch size')
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
-    parser.add_argument('--prompt_path', type=str, default='prompts/pets_prompts.csv', help='Path to csv file with prompts to use')
+    parser.add_argument('--prompt_path', type=str, default='prompts/cifar10_prompts.csv', help='Path to csv file with prompts to use')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
-    parser.add_argument('--samples_per_class', type=int, default=1, help='Number of samples per class for balanced subset')
+    parser.add_argument('--samples_per_class', type=int, default=10, help='Number of samples per class for balanced subset')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
                         help='Model data type to use')
     parser.add_argument('--interpolation', type=str, default='bicubic', help='Resize interpolation type')
@@ -695,11 +699,11 @@ def main():
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
     parser.add_argument('--loss', type=str, default='l1', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
     parser.add_argument('--remove_background', action='store_true', default=False, help='Remove background using BiRefNet before classification')
-    parser.add_argument('--visualize', action='store_true', default=True, help='Visualize error heatmaps during evaluation')
+    parser.add_argument('--visualize', action='store_true', default=False, help='Visualize error heatmaps during evaluation')
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', type=int, default=[1])
-    parser.add_argument('--n_samples', nargs='+', type=int, default=[10])
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[50])
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
