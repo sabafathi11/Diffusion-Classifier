@@ -324,11 +324,11 @@ class DiffusionEvaluator:
         return fig
     
     def eval_error_visualize(self, unet, scheduler, vae, original_image, latent, all_noise, ts, noise_idxs,
-                text_embeds, text_embed_idxs, true_label, batch_size=32, dtype='float32', loss='l2', T=1000,
-                visualize=False, prompts=None):
+                    text_embeds, text_embed_idxs, true_label, batch_size=32, dtype='float32', loss='l2', T=1000,
+                    visualize=False, prompts=None):
         """
         Evaluate denoising error with FULL denoising trajectory from noisy to clean image.
-        Uses the scheduler's proper step() method for correct denoising.
+        Uses proper DDIM-style denoising from timestep t through ALL remaining timesteps to 0.
         
         Args:
             prompts: List of prompt strings corresponding to text_embeds (needed for visualization titles)
@@ -369,82 +369,76 @@ class DiffusionEvaluator:
                     current_latent = noised_latent[sample_idx:sample_idx+1].clone()
                     current_text = text_input[sample_idx:sample_idx+1]
                     
-                    # Create a temporary scheduler instance for this sample
-                    # to avoid modifying the shared scheduler
-                    from diffusers import EulerDiscreteScheduler
-                    temp_scheduler = EulerDiscreteScheduler.from_config(scheduler.config)
+                    # Create timestep schedule from current_t to 0
+                    # Use all timesteps from the scheduler that are <= current_t
+                    all_timesteps = scheduler.timesteps.cpu().numpy()
                     
-                    # Set the number of inference steps based on starting timestep
-                    # Use fewer steps for later timesteps, more for earlier
-                    num_inference_steps = max(20, current_t // 20)  # Adaptive step count
-                    temp_scheduler.set_timesteps(num_inference_steps, device=self.device)
+                    # Find timesteps that are <= current_t
+                    valid_timesteps = [t for t in all_timesteps if t <= current_t]
                     
-                    # Find the closest timestep in the scheduler's timesteps to current_t
-                    timesteps = temp_scheduler.timesteps
-                    start_idx = 0
-                    for i, t in enumerate(timesteps):
-                        if t <= current_t:
-                            start_idx = i
-                            break
+                    # If current_t is not in the scheduler's timesteps, add it at the beginning
+                    if current_t not in valid_timesteps:
+                        valid_timesteps = [current_t] + valid_timesteps
                     
-                    # Use only timesteps from current_t down to 0
-                    denoising_timesteps = timesteps[start_idx:]
+                    denoising_timesteps = torch.tensor(valid_timesteps, device=self.device)
                     
-                    # If we need to start exactly at current_t and it's not in the schedule,
-                    # we need to rescale the latent to match the closest timestep
-                    if len(denoising_timesteps) > 0:
-                        actual_start_t = int(denoising_timesteps[0].item())
+                    # Denoise iteratively through all timesteps
+                    for t_idx in range(len(denoising_timesteps) - 1):
+                        t = denoising_timesteps[t_idx]
+                        t_next = denoising_timesteps[t_idx + 1]
                         
-                        # If there's a mismatch, rescale the noisy latent
-                        if actual_start_t != current_t:
-                            # Rescale from current_t noise level to actual_start_t noise level
-                            alpha_curr = scheduler.alphas_cumprod[int(current_t)]
-                            alpha_start = scheduler.alphas_cumprod[actual_start_t]
-                            
-                            # Extract the signal and noise components
-                            signal_coeff = (alpha_curr ** 0.5)
-                            noise_coeff = ((1 - alpha_curr) ** 0.5)
-                            
-                            # Rescale to new noise level
-                            signal_coeff_new = (alpha_start ** 0.5)
-                            noise_coeff_new = ((1 - alpha_start) ** 0.5)
-                            
-                            current_latent = current_latent * (signal_coeff_new / signal_coeff)
-                    else:
-                        # No timesteps available, just decode as-is
-                        batch_reconstructed.append(current_latent)
-                        continue
-                    
-                    # Denoise iteratively using scheduler.step()
-                    for t in denoising_timesteps:
-                        t_tensor = t.unsqueeze(0) if t.dim() == 0 else t
-                        
-                        # Predict noise
+                        # Predict noise at timestep t
                         if dtype == 'float16':
                             latent_model_input = current_latent.half()
-                            t_input = t_tensor.half()
+                            t_input = torch.tensor([t], device=self.device).half()
                         else:
                             latent_model_input = current_latent
-                            t_input = t_tensor
-                        
-                        # Scale input according to scheduler rules
-                        latent_model_input = temp_scheduler.scale_model_input(current_latent, t)
+                            t_input = torch.tensor([t], device=self.device)
                         
                         noise_pred = unet(
-                            latent_model_input, 
-                            t_input, 
+                            latent_model_input,
+                            t_input,
                             encoder_hidden_states=current_text
                         ).sample
                         
-                        # Use scheduler's step method for proper denoising
-                        step_output = temp_scheduler.step(
-                            noise_pred, 
-                            t, 
-                            current_latent,
-                            return_dict=True
-                        )
+                        # DDIM-style update: predict x0, then get x_{t-1}
+                        alpha_prod_t = scheduler.alphas_cumprod[int(t)]
+                        alpha_prod_t_next = scheduler.alphas_cumprod[int(t_next)]
                         
-                        current_latent = step_output.prev_sample
+                        sqrt_alpha_prod_t = alpha_prod_t ** 0.5
+                        sqrt_one_minus_alpha_prod_t = (1 - alpha_prod_t) ** 0.5
+                        
+                        # Predict x0 from x_t and noise
+                        pred_x0 = (current_latent - sqrt_one_minus_alpha_prod_t * noise_pred) / sqrt_alpha_prod_t
+                        
+                        # Get x_{t_next} from x0 and noise (DDIM formula)
+                        sqrt_alpha_prod_t_next = alpha_prod_t_next ** 0.5
+                        sqrt_one_minus_alpha_prod_t_next = (1 - alpha_prod_t_next) ** 0.5
+                        
+                        current_latent = sqrt_alpha_prod_t_next * pred_x0 + sqrt_one_minus_alpha_prod_t_next * noise_pred
+                    
+                    # Final step: denoise to t=0
+                    t = denoising_timesteps[-1]
+                    if t > 0:  # If we're not already at 0
+                        if dtype == 'float16':
+                            latent_model_input = current_latent.half()
+                            t_input = torch.tensor([t], device=self.device).half()
+                        else:
+                            latent_model_input = current_latent
+                            t_input = torch.tensor([t], device=self.device)
+                        
+                        noise_pred = unet(
+                            latent_model_input,
+                            t_input,
+                            encoder_hidden_states=current_text
+                        ).sample
+                        
+                        # Final prediction to x0
+                        alpha_prod_t = scheduler.alphas_cumprod[int(t)]
+                        sqrt_alpha_prod_t = alpha_prod_t ** 0.5
+                        sqrt_one_minus_alpha_prod_t = (1 - alpha_prod_t) ** 0.5
+                        
+                        current_latent = (current_latent - sqrt_one_minus_alpha_prod_t * noise_pred) / sqrt_alpha_prod_t
                     
                     batch_reconstructed.append(current_latent)
                 
