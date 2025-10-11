@@ -1,352 +1,43 @@
-#!/usr/bin/env python3
-"""
-Image Generator using OpenAI's DALL-E API
-==========================================
+from diffusers import StableDiffusionXLImg2ImgPipeline
+from PIL import Image
+import torch
+from daam import trace, set_seed
+from matplotlib import pyplot as plt
+import numpy as np
 
-This script demonstrates how to generate and save images using OpenAI's DALL-E API.
-It includes comprehensive error handling, image validation, and flexible saving options.
+# Load your existing image
+image_path = "Banana_433.jpg"
+image_pil = Image.open(image_path).convert("RGB").resize((1024, 1024))
 
-Features:
-- Generate images from text prompts
-- Save images in multiple formats (PNG, JPEG, WebP)
-- Automatic filename generation with timestamps
-- Comprehensive error handling
-- Image size and quality validation
-- Batch image generation support
+model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
+device = 'cuda'
+custom_cache = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/SD"
 
-Requirements:
-- OpenAI API key
-- Python 3.7+
-- Required packages: openai, pillow, requests
+pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+    model_id,
+    torch_dtype=torch.float16,
+    use_safetensors=True,
+    variant='fp16',
+    cache_dir=custom_cache,
+).to(device)
 
-Author: AI Assistant
-Date: 2024
-"""
-
-import os
-import sys
-from datetime import datetime
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-import argparse
-
-try:
-    import openai
-    from PIL import Image
-    import requests
-except ImportError as e:
-    print(f"Missing required package: {e}")
-    print("Please install required packages: pip install openai pillow requests")
-    sys.exit(1)
+gen = set_seed(0)
+prompt = "a yellow banana"
+label = "banana"
 
 
-class ImageGenerator:
-    """
-    A comprehensive class for generating images using OpenAI's DALL-E API.
-    
-    This class handles all aspects of image generation including:
-    - API communication
-    - Image downloading and saving
-    - Error handling and validation
-    - File management
-    """
-    
-    # Supported image sizes for DALL-E
-    SUPPORTED_SIZES = {
-        "1024x1024": "1024x1024",
-        "1024x1792": "1024x1792", 
-        "1792x1024": "1792x1024",
-        "512x512": "512x512",  # Legacy size
-        "256x256": "256x256"   # Legacy size
-    }
-    
-    # Supported image formats
-    SUPPORTED_FORMATS = ["png", "jpg", "jpeg", "webp"]
-    
-    def __init__(self, api_key: Optional[str] = None, output_dir: str = "generated_images"):
-        """
-        Initialize the ImageGenerator.
-        
-        Args:
-            api_key: OpenAI API key. If None, will try to get from environment variable OPENAI_API_KEY
-            output_dir: Directory to save generated images
-        """
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "OpenAI API key is required. Set OPENAI_API_KEY environment variable "
-                "or pass api_key parameter."
-            )
-        
-        # Initialize OpenAI client
-        self.client = openai.OpenAI(api_key=self.api_key)
-        
-        # Set up output directory
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        
-        print("ImageGenerator initialized")
-        print(f"Output directory: {self.output_dir.absolute()}")
-    
-    def validate_prompt(self, prompt: str) -> bool:
-        """
-        Validate the image generation prompt.
-        
-        Args:
-            prompt: Text prompt for image generation
-            
-        Returns:
-            bool: True if prompt is valid
-        """
-        if not prompt or not prompt.strip():
-            raise ValueError("Prompt cannot be empty")
-        
-        return True
-    
-    def validate_size(self, size: str) -> str:
-        """
-        Validate and normalize image size.
-        
-        Args:
-            size: Image size string
-            
-        Returns:
-            str: Validated size string
-        """
-        if size not in self.SUPPORTED_SIZES:
-            raise ValueError(
-                f"Unsupported size: {size}. "
-                f"Supported sizes: {list(self.SUPPORTED_SIZES.keys())}"
-            )
-        return self.SUPPORTED_SIZES[size]
-    
-    def generate_filename(self, prompt: str, format: str = "png", index: int = 0) -> str:
-        """
-        Generate a unique filename for the image.
-        
-        Args:
-            prompt: Original prompt
-            format: Image format
-            index: Index for batch generation
-            
-        Returns:
-            str: Generated filename
-        """
-        # Create a safe filename from prompt
-        safe_prompt = "".join(c for c in prompt[:50] if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        safe_prompt = safe_prompt.replace(' ', '_')
-        
-        # Add timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Add index if batch generation
-        index_suffix = f"_{index}" if index > 0 else ""
-        
-        return f"{safe_prompt}_{timestamp}{index_suffix}.{format}"
-    
-    def download_image(self, url: str, filename: str) -> bool:
-        """
-        Download image from URL and save to file.
-        
-        Args:
-            url: Image URL
-            filename: Local filename to save
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            print(f"Downloading image from: {url}")
-            
-            # Download image
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            
-            # Save image
-            filepath = self.output_dir / filename
-            with open(filepath, 'wb') as f:
-                f.write(response.content)
-            
-            # Validate image
-            try:
-                with Image.open(filepath) as img:
-                    img.verify()
-                print(f"Image saved: {filepath}")
-                return True
-            except Exception as e:
-                print(f"Downloaded file is not a valid image: {e}")
-                filepath.unlink()  # Remove invalid file
-                return False
-                
-        except requests.RequestException as e:
-            print(f"Failed to download image: {e}")
-            return False
-        except Exception as e:
-            print(f"Unexpected error downloading image: {e}")
-            return False
-    
-    def generate_image(
-        self, 
-        prompt: str, 
-        size: str = "1024x1024", 
-        quality: str = "standard",
-        style: str = "vivid",
-        n: int = 1,
-        format: str = "png",
-        model: str = "dall-e-3"
-    ) -> List[Dict[str, Any]]:
-        """
-        Generate image(s) using DALL-E API.
-        
-        Args:
-            prompt: Text description of the image
-            size: Image size (1024x1024, 1024x1792, 1792x1024)
-            quality: Image quality (standard, hd)
-            style: Image style (vivid, natural)
-            n: Number of images to generate (1-10)
-            format: Output format (png, jpg, webp)
-            model: DALL-E model to use (dall-e-3, dall-e-2)
-            
-        Returns:
-            List[Dict]: List of generation results with metadata
-        """
-        # Validate inputs
-        self.validate_prompt(prompt)
-        size = self.validate_size(size)
-        
-        if n < 1 or n > 10:
-            raise ValueError("Number of images must be between 1 and 10")
-        
-        if format.lower() not in self.SUPPORTED_FORMATS:
-            raise ValueError(f"Unsupported format: {format}")
-        
-        print(f"Generating {n} image(s) with prompt: '{prompt}'")
-        print(f"Size: {size}, Quality: {quality}, Style: {style}, Model: {model}")
-        
-        try:
-            # Call DALL-E API
-            response = self.client.images.generate(
-                model=model,
-                prompt=prompt,
-                size=size,
-                quality=quality,
-                style=style,
-                n=n
-            )
-            
-            results = []
-            for i, image_data in enumerate(response.data):
-                # Generate filename
-                filename = self.generate_filename(prompt, format, i)
-                
-                # Download and save image
-                success = self.download_image(image_data.url, filename)
-                
-                result = {
-                    "prompt": prompt,
-                    "filename": filename,
-                    "url": image_data.url,
-                    "size": size,
-                    "quality": quality,
-                    "style": style,
-                    "model": model,
-                    "success": success,
-                    "filepath": str(self.output_dir / filename) if success else None
-                }
-                results.append(result)
-                
-                if success:
-                    print(f"Image {i+1}/{n} generated")
-                else:
-                    print(f"Failed to save image {i+1}/{n}")
-            
-            return results
-            
-        except openai.APIError as e:
-            print(f"OpenAI API Error: {e}")
-            raise
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            raise
+with torch.no_grad():
+    with trace(pipe) as tc:
+        out = pipe(
+            prompt=prompt,
+            image=image_pil,
+            strength=0.03,      # tiny value to avoid changes but keep pipeline working
+            num_inference_steps=50,
+            generator=gen
+        )
 
+        heat_map = tc.compute_global_heat_map()
+        heat_map = heat_map.compute_word_heat_map(label)
 
-def main():
-    """
-    Main function with command-line interface.
-    """
-    parser = argparse.ArgumentParser(
-        description="Generate images using OpenAI's DALL-E API",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python image_generator.py "A beautiful sunset over mountains"
-  python image_generator.py "A cute cat" --size 1024x1792 --quality hd --model dall-e-3
-  python image_generator.py "Abstract art" --n 3 --model dall-e-2
-        """
-    )
-    
-    parser.add_argument("prompt", nargs="?",
-                         default=
-    "A single red banana, centered in the frame. "
-    "Highly realistic close-up photograph, showing only one banana. "
-    "The banana should look natural and fresh, with realistic texture, "
-    "captured in professional food photography style under natural lighting.",
-                         help="Text prompt for image generation")
-    parser.add_argument("--size", default="1024x1024", 
-                       choices=["1024x1024", "1024x1792", "1792x1024"],
-                       help="Image size (default: 1024x1024)")
-    parser.add_argument("--quality", default="standard", choices=["standard", "hd"],
-                       help="Image quality (default: standard)")
-    parser.add_argument("--style", default="natural", choices=["vivid", "natural"],
-                       help="Image style (default: natural)")
-    parser.add_argument("--n", type=int, default=1, help="Number of images (1-10, default: 1)")
-    parser.add_argument("--format", default="png", choices=["png", "jpg", "jpeg", "webp"],
-                       help="Output format (default: png)")
-    parser.add_argument("--output-dir", default="generated_images",
-                       help="Output directory (default: generated_images)")
-    parser.add_argument("--api-key", help="OpenAI API key (or set OPENAI_API_KEY env var)")
-    parser.add_argument("--model", default="dall-e-3", choices=["dall-e-3", "dall-e-2"],
-                       help="DALL-E model to use (default: dall-e-3)")
-    
-    args = parser.parse_args()
-    
-    try:
-        # Initialize generator
-        generator = ImageGenerator(api_key=args.api_key, output_dir=args.output_dir)
-        
-        if args.prompt:
-            # Single prompt generation
-            results = generator.generate_image(
-                prompt=args.prompt,
-                size=args.size,
-                quality=args.quality,
-                style=args.style,
-                n=args.n,
-                format=args.format,
-                model=args.model
-            )
-        else:
-            print("Please provide a prompt")
-            parser.print_help()
-            return 1
-        
-        # Print outputs
-        if results:
-            successful = sum(1 for r in results if r.get("success", False))
-            print(f"Generated {successful}/{len(results)} images")
-            for r in results:
-                if r.get("success"):
-                    print(f"Saved: {r.get('filepath')}")
-        
-        return 0
-        
-    except KeyboardInterrupt:
-        print("Generation cancelled by user")
-        return 1
-    except Exception as e:
-        print(f"Error: {e}")
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        heat_map.plot_overlay(out.images[0])
+        plt.savefig(f'heat_map_{label}1.png')
