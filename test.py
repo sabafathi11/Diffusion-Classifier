@@ -1,43 +1,40 @@
-from diffusers import StableDiffusionXLImg2ImgPipeline
-from PIL import Image
-import torch
-from daam import trace, set_seed
-from matplotlib import pyplot as plt
-import numpy as np
+import matplotlib.pyplot as plt
+from datasets import load_dataset
 
-# Load your existing image
-image_path = "Banana_433.jpg"
-image_pil = Image.open(image_path).convert("RGB").resize((1024, 1024))
+# Load datasets
+comco = load_dataset("clip-oscope/simco-comco", data_dir="ComCo")
+simco = load_dataset("clip-oscope/simco-comco", data_dir="SimCo")
 
-model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
-device = 'cuda'
-custom_cache = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/SD"
+# Function to display images from a dataset
+def show_images(dataset, dataset_name, num_images=6):
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle(f'{dataset_name} Sample Images', fontsize=16)
+    
+    for idx, ax in enumerate(axes.flat):
+        if idx < num_images:
+            # Get the image
+            image = dataset['train'][idx]['image']
+            
+            # Display the image
+            ax.imshow(image)
+            ax.set_title(f'Index: {idx}')
+            ax.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(f'{dataset_name}_samples.png')
 
-pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-    model_id,
-    torch_dtype=torch.float16,
-    use_safetensors=True,
-    variant='fp16',
-    cache_dir=custom_cache,
-).to(device)
+# Show ComCo samples
+show_images(comco, 'ComCo', num_images=6)
 
-gen = set_seed(0)
-prompt = "a yellow banana"
-label = "banana"
+# Show SimCo samples
+show_images(simco, 'SimCo', num_images=6)
 
+# To see more details about a specific image:
+print("\nComCo first image details:")
+print(f"Type: {type(comco['train'][0]['image'])}")
+print(f"Size: {comco['train'][0]['image'].size}")
+print(f"Mode: {comco['train'][0]['image'].mode}")
 
-with torch.no_grad():
-    with trace(pipe) as tc:
-        out = pipe(
-            prompt=prompt,
-            image=image_pil,
-            strength=0.03,      # tiny value to avoid changes but keep pipeline working
-            num_inference_steps=50,
-            generator=gen
-        )
-
-        heat_map = tc.compute_global_heat_map()
-        heat_map = heat_map.compute_word_heat_map(label)
-
-        heat_map.plot_overlay(out.images[0])
-        plt.savefig(f'heat_map_{label}1.png')
+# To access image file names if they exist in the dataset metadata:
+print("\nDataset features:")
+print(comco['train'].features)
