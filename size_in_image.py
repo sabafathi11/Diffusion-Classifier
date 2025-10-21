@@ -35,15 +35,28 @@ INTERPOLATIONS = {
     'lanczos': InterpolationMode.LANCZOS,
 }
 
-
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
 
+def pad_to_square(image):
+    """Pad image to square shape"""
+    width, height = image.size
+    max_dim = max(width, height)
+    
+    # Calculate padding for each side
+    pad_left = (max_dim - width) // 2
+    pad_right = max_dim - width - pad_left
+    pad_top = (max_dim - height) // 2
+    pad_bottom = max_dim - height - pad_top
+    
+    # Apply padding (left, top, right, bottom)
+    padding = (pad_left, pad_top, pad_right, pad_bottom)
+    return torch_transforms.functional.pad(image, padding, fill=255, padding_mode='constant')
 
 def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     transform = torch_transforms.Compose([
+        torch_transforms.Lambda(pad_to_square),
         torch_transforms.Resize(size, interpolation=interpolation),
-        torch_transforms.CenterCrop(size),
         _convert_image_to_rgb,
         torch_transforms.ToTensor(),
         torch_transforms.Normalize([0.5], [0.5])
@@ -57,44 +70,85 @@ def center_crop_resize(img, interpolation=InterpolationMode.BILINEAR):
 
 
 class MultiObjectDataset:
-    """Custom dataset for multi-object images with filename-based labels."""
+    """Custom dataset for multi-object images with position-based subfolders."""
     
     def __init__(self, root_dir, transform=None):
         self.root_dir = Path(root_dir)
         self.transform = transform
-        self.image_paths = sorted(list(self.root_dir.glob("*.png")) + list(self.root_dir.glob("*.jpg")))
+        self.image_data = []  # Will store (path, objects, position, filename)
         
-        if len(self.image_paths) == 0:
-            raise ValueError(f"No images found in {root_dir}")
+        # Process each position subfolder
+        for position in ['left',]:
+            position_dir = self.root_dir / position
+            if not position_dir.exists():
+                print(f"Warning: {position_dir} does not exist, skipping")
+                continue
+            
+            image_paths = sorted(list(position_dir.glob("*.png")) + list(position_dir.glob("*.jpg")))
+            
+            for img_path in image_paths:
+                filename = img_path.stem
+                objects = filename.split('_')[1:]
+                self.image_data.append({
+                    'path': img_path,
+                    'objects': objects,
+                    'position': position,
+                    'filename': filename
+                })
+        
+        if len(self.image_data) == 0:
+            raise ValueError(f"No images found in {root_dir}/{{left,middle,right}}")
         
         # Extract all unique objects from all filenames
         all_objects_set = set()
-        for img_path in self.image_paths:
-            filename = img_path.stem
-            objects = filename.split('_')
-            all_objects_set.update(objects)
+        for data in self.image_data:
+            all_objects_set.update(data['objects'])
         
         self.all_objects = sorted(list(all_objects_set))
         
-        print(f"Found {len(self.image_paths)} images in {root_dir}")
+        print(f"Found {len(self.image_data)} images total:")
+        print(f"  - left: {sum(1 for d in self.image_data if d['position'] == 'left')}")
+        print(f"  - middle: {sum(1 for d in self.image_data if d['position'] == 'middle')}")
+        print(f"  - right: {sum(1 for d in self.image_data if d['position'] == 'right')}")
         print(f"Found {len(self.all_objects)} unique objects: {self.all_objects}")
     
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.image_data)
     
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        image = Image.open(img_path)
+        data = self.image_data[idx]
+        image = Image.open(data['path'])
         
         if self.transform:
             image = self.transform(image)
         
-        # Extract objects from filename (e.g., "axe_backpack_bird.png" -> ["axe", "backpack", "bird"])
-        filename = img_path.stem
-        objects = filename.split('_')
-        
-        return image, objects, filename
+        return image, data['objects'], data['position'], data['filename']
 
+
+def find_biggest_object_position(objects, position):
+    """
+    Determine which object is the biggest based on the position folder.
+    
+    Args:
+        objects: list of object names from filename
+        position: 'left', 'middle', or 'right' indicating biggest object position in filename
+    
+    Returns:
+        tuple: (biggest_object, other_objects)
+    """
+    if position == 'left':
+        biggest_idx = 0
+    elif position == 'middle':
+        biggest_idx = len(objects) // 2
+    elif position == 'right':
+        biggest_idx = len(objects) - 1
+    else:
+        raise ValueError(f"Unknown position: {position}")
+    
+    biggest_object = objects[biggest_idx]
+    other_objects = [obj for i, obj in enumerate(objects) if i != biggest_idx]
+    
+    return biggest_object, other_objects
 
 
 def create_prompts_for_scenario(dataset, scenario_mode):
@@ -108,13 +162,21 @@ def create_prompts_for_scenario(dataset, scenario_mode):
     all_objects = dataset.all_objects
     
     for idx in range(len(dataset)):
-        _, objects, filename = dataset[idx]
+        _, objects, position, filename = dataset[idx]
         
         if len(objects) < 3:
             print(f"Warning: {filename} has less than 3 objects, skipping")
             continue
         
-        obj1, obj2, obj3 = objects[0], objects[1], objects[2]  # obj1 is biggest
+        # Determine which object is the biggest based on position
+        biggest_object, other_objects = find_biggest_object_position(objects, position)
+        
+        # We need at least 2 other objects to create prompts
+        if len(other_objects) < 2:
+            print(f"Warning: {filename} needs at least 3 objects total, skipping")
+            continue
+        
+        obj2, obj3 = other_objects[0], other_objects[1]
         
         # Select a wrong object that is NOT in the current image
         available_wrong_objects = [obj for obj in all_objects if obj not in objects]
@@ -126,29 +188,25 @@ def create_prompts_for_scenario(dataset, scenario_mode):
         wrong_object = random.choice(available_wrong_objects)
         
         if scenario_mode == 1:
-            # Scenario 1: Biggest object first in both
-            positive_prompt = f"a photo of a {obj1}, a {obj2}, and a {obj3}"
-            negative_prompt = f"a photo of a {obj1}, a {obj2}, and a {wrong_object}"
+            positive_prompt = f"a photo of a {biggest_object}, a {obj2}, and a {obj3}"
+            negative_prompt = f"a photo of a {wrong_object}, a {obj2}, and a {obj3}"
             
         elif scenario_mode == 2:
-            # Scenario 2: Biggest object last in positive, first in negative
-            positive_prompt = f"a photo of a {obj2}, a {obj3}, and a {obj1}"
-            negative_prompt = f"a photo of a {obj1}, a {obj2}, and a {wrong_object}"
+            positive_prompt = f"a photo of a {obj2}, a {obj3}, and a {biggest_object}"
+            negative_prompt = f"a photo of a {biggest_object}, a {obj2}, and a {wrong_object}"
+        
         
         else:
             raise ValueError(f"Unknown scenario mode: {scenario_mode}")
         
-        print(f"Image: {filename}"
-              f"\n  Positive: {positive_prompt}"
-              f"\n  Negative: {negative_prompt}"
-              f"\n  Wrong object: {wrong_object}\n")
         
         prompt_data.append({
             'filename': filename,
+            'position': position,
             'positive_prompt': positive_prompt,
             'negative_prompt': negative_prompt,
             'objects': '_'.join(objects),
-            'biggest_object': obj1,
+            'biggest_object': biggest_object,
             'wrong_object': wrong_object
         })
     
@@ -316,6 +374,7 @@ class MultiObjectDiffusionEvaluator:
         remaining_prmpt_idxs = list(range(len(text_embeds)))
         start = T // max_n_samples // 2
         t_to_eval = list(range(start, T, T // max_n_samples))[:max_n_samples]
+        #t_to_eval = np.linspace(800, 999, max_n_samples, dtype=int).tolist()
 
         for n_samples, n_to_keep in zip(args.n_samples, args.to_keep):
             ts = []
@@ -407,13 +466,23 @@ class MultiObjectDiffusionEvaluator:
                 f.write("  - Positive: biggest object last\n")
                 f.write("  - Negative: biggest object first, wrong 3rd object\n")
             
-            f.write(f"Overall Results:\n")
+            f.write(f"\nOverall Results:\n")
             f.write(f"Total samples: {total}\n")
             f.write(f"Correct (chose positive prompt): {correct}\n")
             f.write(f"Incorrect (chose negative prompt): {total - correct}\n")
             f.write(f"Accuracy: {accuracy:.2f}%\n\n")
             
-            f.write(f"Configuration:\n")
+            # Breakdown by position
+            f.write("Results by Position:\n")
+            for position in ['left', 'middle', 'right']:
+                position_results = [r for r in self.results_details if r.get('position') == position]
+                if position_results:
+                    pos_correct = sum(1 for r in position_results if r['chose_positive'])
+                    pos_total = len(position_results)
+                    pos_acc = (pos_correct / pos_total * 100) if pos_total > 0 else 0
+                    f.write(f"  {position}: {pos_correct}/{pos_total} ({pos_acc:.2f}%)\n")
+            
+            f.write(f"\nConfiguration:\n")
             f.write(f"Version: {self.args.version}\n")
             f.write(f"Image size: {self.args.img_size}\n")
             f.write(f"Background removal: {self.args.remove_background}\n")
@@ -450,7 +519,7 @@ class MultiObjectDiffusionEvaluator:
                     self.all_labels.append(0)
                 continue
             
-            image, objects, filename = self.target_dataset[i]
+            image, objects, position, filename = self.target_dataset[i]
             
             # Remove background if requested
             if self.args.remove_background:
@@ -477,6 +546,7 @@ class MultiObjectDiffusionEvaluator:
             
             result_detail = {
                 'filename': filename,
+                'position': position,
                 'objects': '_'.join(objects),
                 'chose_positive': chose_positive,
                 'positive_loss': pred_errors[pred_idx]['pred_errors'].mean().item(),
@@ -490,6 +560,7 @@ class MultiObjectDiffusionEvaluator:
                 'errors': pred_errors,
                 'chose_positive': chose_positive,
                 'filename': filename,
+                'position': position,
                 'objects': objects
             }, fname)
             
@@ -508,10 +579,10 @@ def main():
 
     # Dataset args
     parser.add_argument('--dataset_path', type=str, 
-                        default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/size-in-image',
-                        help='Path to dataset directory')
+                        default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/comco/3',
+                        help='Path to dataset directory containing left/middle/right subfolders')
     parser.add_argument('--scenario_mode', type=int, default=2, choices=[1, 2],
-                        help='Scenario 1: biggest first in both; Scenario 2: biggest last in positive, first in negative')
+                        help='Scenario 1: biggest obj changed; Scenario 2: other obj changed')
 
     # Model args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
@@ -530,7 +601,7 @@ def main():
 
     # Adaptive sampling args
     parser.add_argument('--to_keep', nargs='+', type=int, default=[1])
-    parser.add_argument('--n_samples', nargs='+', type=int, default=[50])
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[500])
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
