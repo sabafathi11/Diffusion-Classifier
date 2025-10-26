@@ -1330,7 +1330,7 @@ def main():
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
-    parser.add_argument('--batch_size', '-b', type=int, default=32, help='Batch size')
+    parser.add_argument('--batch_size', '-b', type=int, default=1, help='Batch size')
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
@@ -1342,9 +1342,9 @@ def main():
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', default=[1], type=int)
-    parser.add_argument('--n_samples', nargs='+', default=[50], type=int)
+    parser.add_argument('--n_samples', nargs='+', default=[5], type=int)
 
-    parser.add_argument('--visualize', action='store_true', default=False, help='Visualize error heatmaps during evaluation')
+    parser.add_argument('--visualize', action='store_true', default=True, help='Visualize error heatmaps during evaluation')
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)

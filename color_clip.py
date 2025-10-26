@@ -222,14 +222,10 @@ class CLIPColorEvaluator:
         """Create prompts for all 5 colors for a specific fruit"""
         prompts = []
         for color in ALL_COLORS:
-            if self.args.prompt_template == 'simple':
-                prompt = f"a {color} {target_fruit} is in this picture"
-            elif self.args.prompt_template == 'descriptive':
-                prompt = f"In this picture, the color of the {target_fruit} is {color}."
-            elif self.args.prompt_template == 'natural':
-                prompt = f"a {target_fruit} that is {color}"
+            if self.args.mode in ['compound', 'compound_unnatural']:
+                prompt = f"A {color.lower()} {target_fruit.lower()} and another object."
             else:
-                prompt = f"a {color} {target_fruit}"
+                prompt = f"A {color.lower()} {target_fruit.lower()}."
             prompts.append(prompt)
         return prompts
 
@@ -732,7 +728,7 @@ def main():
     parser.add_argument('--cab_folder', type=str,
                         default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/color',
                         help='Path to color folder')
-    parser.add_argument('--mode', type=str, default='compound', 
+    parser.add_argument('--mode', type=str, default='compound_unnatural', 
                         choices=['compound', 'single', 'compound_unnatural', 'single_unnatural'],
                         help='Mode: compound for two-fruit images, single for single-fruit images, ' + 
                             'compound_unnatural for unnatural color combinations, single_unnatural for single unnatural fruits')

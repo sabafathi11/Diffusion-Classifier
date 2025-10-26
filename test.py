@@ -1,86 +1,86 @@
-import os
-import shutil
-from pathlib import Path
-from collections import defaultdict
+# # import os
+# # import shutil
+# # from pathlib import Path
+# # from collections import defaultdict
 
-def get_image_type(filename):
-    """Extract the object type from filename (e.g., 'blender' from 'blender_snowboard_clock.png')"""
-    # Split by underscore and take first part to identify the type
-    parts = filename.split('_')
-    return parts[0]
+# # def get_image_type(filename):
+# #     """Extract the object type from filename (e.g., 'blender' from 'blender_snowboard_clock.png')"""
+# #     # Split by underscore and take first part to identify the type
+# #     parts = filename.split('_')
+# #     return parts[0]
 
-def copy_first_n_images_by_type(source_folders, destination_folder, n=10):
-    """
-    Copy the first n images of each type from source folders to destination folder.
+# # def copy_first_n_images_by_type(source_folders, destination_folder, n=10):
+# #     """
+# #     Copy the first n images of each type from source folders to destination folder.
     
-    Args:
-        source_folders: List of source folder paths
-        destination_folder: Destination folder path
-        n: Number of images per type to copy (default: 10)
-    """
-    # Create destination folder if it doesn't exist
-    os.makedirs(destination_folder, exist_ok=True)
+# #     Args:
+# #         source_folders: List of source folder paths
+# #         destination_folder: Destination folder path
+# #         n: Number of images per type to copy (default: 10)
+# #     """
+# #     # Create destination folder if it doesn't exist
+# #     os.makedirs(destination_folder, exist_ok=True)
     
-    # Supported image extensions
-    image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff'}
+# #     # Supported image extensions
+# #     image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff'}
     
-    # Process each source folder
-    for folder_idx, source_folder in enumerate(source_folders, 1):
-        if not os.path.exists(source_folder):
-            print(f"Warning: Source folder '{source_folder}' does not exist. Skipping...")
-            continue
+# #     # Process each source folder
+# #     for folder_idx, source_folder in enumerate(source_folders, 1):
+# #         if not os.path.exists(source_folder):
+# #             print(f"Warning: Source folder '{source_folder}' does not exist. Skipping...")
+# #             continue
         
-        print(f"\nProcessing folder {folder_idx}: {source_folder}")
+# #         print(f"\nProcessing folder {folder_idx}: {source_folder}")
         
-        # Group images by type
-        images_by_type = defaultdict(list)
+# #         # Group images by type
+# #         images_by_type = defaultdict(list)
         
-        # Get all image files from the source folder
-        for filename in sorted(os.listdir(source_folder)):
-            file_path = os.path.join(source_folder, filename)
+# #         # Get all image files from the source folder
+# #         for filename in sorted(os.listdir(source_folder)):
+# #             file_path = os.path.join(source_folder, filename)
             
-            # Check if it's a file and has an image extension
-            if os.path.isfile(file_path):
-                ext = os.path.splitext(filename)[1].lower()
-                if ext in image_extensions:
-                    image_type = get_image_type(filename)
-                    images_by_type[image_type].append(filename)
+# #             # Check if it's a file and has an image extension
+# #             if os.path.isfile(file_path):
+# #                 ext = os.path.splitext(filename)[1].lower()
+# #                 if ext in image_extensions:
+# #                     image_type = get_image_type(filename)
+# #                     images_by_type[image_type].append(filename)
         
-        # Copy first n images of each type
-        total_copied = 0
-        for image_type, files in sorted(images_by_type.items()):
-            # Take only first n files of this type
-            files_to_copy = files[:n]
+# #         # Copy first n images of each type
+# #         total_copied = 0
+# #         for image_type, files in sorted(images_by_type.items()):
+# #             # Take only first n files of this type
+# #             files_to_copy = files[:n]
             
-            print(f"  Type '{image_type}': Found {len(files)} images, copying {len(files_to_copy)}")
+# #             print(f"  Type '{image_type}': Found {len(files)} images, copying {len(files_to_copy)}")
             
-            for filename in files_to_copy:
-                src_path = os.path.join(source_folder, filename)
+# #             for filename in files_to_copy:
+# #                 src_path = os.path.join(source_folder, filename)
                 
-                # Create unique filename with folder prefix to avoid conflicts
-                dst_filename = f"folder{folder_idx}_{filename}"
-                dst_path = os.path.join(destination_folder, dst_filename)
+# #                 # Create unique filename with folder prefix to avoid conflicts
+# #                 dst_filename = f"folder{folder_idx}_{filename}"
+# #                 dst_path = os.path.join(destination_folder, dst_filename)
                 
-                shutil.copy2(src_path, dst_path)
-                total_copied += 1
+# #                 shutil.copy2(src_path, dst_path)
+# #                 total_copied += 1
         
-        print(f"  Total copied from this folder: {total_copied} images")
+# #         print(f"  Total copied from this folder: {total_copied} images")
 
 
-if __name__ == "__main__":
-    # Define your source folders
-    source_folders = [
-        "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/comco/CoCo-FiveObject-MBig",
-        #"/mnt/public/Ehsan/docker_private/learning2/saba/datasets/comco/CoCo-FiveObject-UR-Big",
-    ]
+# # if __name__ == "__main__":
+# #     # Define your source folders
+# #     source_folders = [
+# #         "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/comco/CoCo-FiveObject-MBig",
+# #         #"/mnt/public/Ehsan/docker_private/learning2/saba/datasets/comco/CoCo-FiveObject-UR-Big",
+# #     ]
     
-    # Define destination folder
-    destination_folder = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/comco/5/middle"
+# #     # Define destination folder
+# #     destination_folder = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/comco/5/middle"
     
-    # Copy first 10 images of each type from each folder
-    copy_first_n_images_by_type(source_folders, destination_folder, n=10)
+# #     # Copy first 10 images of each type from each folder
+# #     copy_first_n_images_by_type(source_folders, destination_folder, n=10)
     
-    print(f"\n✓ All images copied to '{destination_folder}'")
+# #     print(f"\n✓ All images copied to '{destination_folder}'")
 
 # #!/usr/bin/env python3
 # """
@@ -370,7 +370,8 @@ if __name__ == "__main__":
 #     )
     
 #     parser.add_argument("prompt", nargs="?",
-#                          default="A coin, shot on a clean plain background, central composition, highly detailed, realistic lighting, ultra-high resolution, studio quality",
+#                         # , shot on a clean plain background, central composition, highly detailed, realistic lighting, ultra-high resolution, studio quality
+#                          default="A car",
 #                          help="Text prompt for image generation")
 #     parser.add_argument("--size", default="1024x1024", 
 #                        choices=["1024x1024", "1024x1792", "1792x1024"],
@@ -430,3 +431,48 @@ if __name__ == "__main__":
 
 # if __name__ == "__main__":
 #     sys.exit(main())
+
+
+from diffusers import StableDiffusionXLImg2ImgPipeline
+from PIL import Image
+import torch
+from daam import trace, set_seed
+from matplotlib import pyplot as plt
+import numpy as np
+
+# Load your existing image
+image_path = "folder1_apple_bed.png"
+image_pil = Image.open(image_path).convert("RGB").resize((1024, 1024))
+
+model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
+device = 'cuda'
+
+pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+    model_id,
+    torch_dtype=torch.float16,
+    use_safetensors=True,
+    variant='fp16',
+).to(device)
+
+
+prompt = "a red apple and a bed"
+gen = set_seed(0)
+
+label = 'red'
+
+with torch.no_grad():
+    with trace(pipe) as tc:
+        out = pipe(
+            prompt=prompt,
+            image=image_pil,
+            strength=0.03,      # tiny value to avoid changes but keep pipeline working
+            num_inference_steps=150,
+            generator=gen
+        )
+
+        heat_map = tc.compute_global_heat_map()
+        heat_map = heat_map.compute_word_heat_map(label)
+
+        heat_map.plot_overlay(out.images[0])
+        plt.savefig(f'heat_map_{label}2.png')
+
