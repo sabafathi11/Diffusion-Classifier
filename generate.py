@@ -6,6 +6,8 @@ Batch Image Generator for Multiple Objects
 This script generates multiple images for predefined objects organized in folders.
 """
 
+### used : 743/1000
+
 import os
 import sys
 from datetime import datetime
@@ -36,16 +38,6 @@ class BatchImageGenerator:
     
     # Define all objects organized by folders
     OBJECTS = {
-        #"folder_1": ["Tree", "Car", "Person", "Fish", "House", "Airplane", "Flower", "Book", "Chair", "Cat" ],
-        "folder_2": ["car"],
-        #"folder_2": ["Table", "Spoon", "Mug", "Blanket", "Door", "Shoe", "Bag", "Candle", "Ring", "Statue"],
-        #"folder_2": [],
-        #"folder_3": ["Ball", "Box", "Plate", "Clock", "Window", "Wheel", "Dice", "Coin"],
-        #"folder_3": [],
-        #"folder_4": ["Elephant", "Ant", "Whale", "Mouse", "Mountain", "Pebble", "Truck", "Key", "Building", "Bird"],
-        #"folder_4": [],
-        #"folder_5": ["Tea", "Coffee", "Soup", "Ice cube", "Water bottle", "Juice", "Fireplace", "Stove", "Engine", "Ice cream"]
-        #"folder_5": [],
     }
     
     def __init__(self, api_key: Optional[str] = None, output_dir: str = "generated_images"):
@@ -80,6 +72,7 @@ class BatchImageGenerator:
         Returns:
             str: Formatted prompt
         """
+        #return "A realistic, detailed truck on a pure white background, centered in the frame. No text, no people, no shadows extending beyond the truck — just the vehicle isolated on a white background, high resolution, studio-style lighting."
         return f"A realistic, high-quality image of a {object_name} centered on a plain white background, studio lighting, no shadows, no text, no people, minimalistic composition."
         #return f"A {object_name}, shot on a clean plain background, central composition, highly detailed, realistic lighting, ultra-high resolution, studio quality"
     
@@ -334,7 +327,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate multiple images for multiple objects organized in folders"
     )
-    parser.add_argument("--num-images", type=int, default=1,
+    parser.add_argument("--num-images", type=int, default=4,
                        help="Number of images per object")
     parser.add_argument("--size", default="1024x1024",
                        choices=["1024x1024", "1024x1792", "1792x1024"],
@@ -343,7 +336,7 @@ def main():
                        help="Image quality (default: standard)")
     parser.add_argument("--style", default="natural", choices=["vivid", "natural"],
                        help="Image style (default: natural)")
-    parser.add_argument("--output-dir", default="/mnt/public/Ehsan/docker_private/learning2/saba/datasets/attrs2",
+    parser.add_argument("--output-dir", default="/mnt/public/Ehsan/docker_private/learning2/saba/datasets/attrs7",
                        help="Base output directory (default: generated_images)")
     parser.add_argument("--api-key", help="OpenAI API key (or set OPENAI_API_KEY env var)")
     parser.add_argument("--model", default="dall-e-3", choices=["dall-e-3", "dall-e-2"],

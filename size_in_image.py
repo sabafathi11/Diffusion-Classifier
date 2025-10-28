@@ -26,7 +26,8 @@ seed = 43
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
-np.random.seed(seed) 
+np.random.seed(seed)
+random.seed(42)
 
 INTERPOLATIONS = {
     'bilinear': InterpolationMode.BILINEAR,
@@ -1064,7 +1065,7 @@ def main():
     parser.add_argument('--positions', nargs='+', type=str, default=['left'],
                         choices=['left', 'right', 'middle', 'up', 'down'],
                         help='Position subfolders to use (e.g., --positions left right)')
-    parser.add_argument('--scenario_modes', nargs='+', type=int, default=[1], 
+    parser.add_argument('--scenario_modes', nargs='+', type=int, default=[2], 
                         choices=[1, 2],
                         help='Scenario modes to test (e.g., --scenario_modes 1 2)')
 
@@ -1085,7 +1086,7 @@ def main():
 
     # Adaptive sampling args
     parser.add_argument('--to_keep', nargs='+', type=int, default=[1])
-    parser.add_argument('--n_samples', nargs='+', type=int, default=[5])
+    parser.add_argument('--n_samples', nargs='+', type=int, default=[50])
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
