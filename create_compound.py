@@ -19,16 +19,16 @@ ATTRIBUTES = {
         "Cat": "tailed"
     },
     "Shape": {
-        "Ball": "round",
-        "Box": "square",
+        "Ball": "circular",
         "Plate": "circular",
-        "Clock": "round",
-        "Window": "rectangular",
+        "Clock": "circular",
         "Wheel": "circular",
-        "Dice": "cubic",
-        "Coin": "round",
+        "Coin": "circular",
+        "Box": "rectangular",
+        "Window": "rectangular",
         "Book": "rectangular",
-        "Table": "rectangular"
+        "Table": "rectangular",
+        "Door": "rectangular"
     },
     "Material & Texture": {
         "Table": "wooden",
@@ -44,14 +44,14 @@ ATTRIBUTES = {
     },
     "Size": {
         "Elephant": "big",
+        "Whale": "big",
+        "Truck": "big",
+        "Building": "big",
+        "wind turbine": "big",
         "Ant": "small",
-        "Whale": "huge",
         "Mouse": "small",
-        "wind turbine": "tall",
-        "Pebble": "tiny",
-        "Truck": "large",
+        "Pebble": "small",
         "Key": "small",
-        "Building": "tall",
         "Bird": "small"
     },
     "Temperature": {
@@ -70,13 +70,17 @@ ATTRIBUTES = {
 
 # Define similar attributes that shouldn't be paired
 SIMILAR_ATTRIBUTES = {
+    "Part-Whole": [
+        {"leafy","petaled"},
+        {"feathered", "finned"},
+    ],
     "Shape": [
-        {"round", "circular"},
-        {"square", "rectangular", "cubic"}
+        {"circular"},
+        {"rectangular"}
     ],
     "Size": [
-        {"big", "large", "huge", "tall"},
-        {"small", "tiny"}
+        {"big"},
+        {"small"}
     ],
     "Temperature": [
         {"hot"},
@@ -96,12 +100,13 @@ def are_attributes_similar(attr1, attr2, category):
     
     return False
 
-def get_first_image(obj_folder):
-    """Get the first image from an object folder."""
+def get_all_images(obj_folder):
+    """Get all images from an object folder."""
+    images = []
     for file in sorted(os.listdir(obj_folder)):
         if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-            return os.path.join(obj_folder, file)
-    return None
+            images.append(os.path.join(obj_folder, file))
+    return images
 
 def create_compound_image(img1_path, img2_path, output_path):
     """Create a compound image by placing two images side by side."""
@@ -124,7 +129,7 @@ def create_compound_image(img1_path, img2_path, output_path):
     
     return img1_path, img2_path
 
-def process_category(category_name, input_base, output_base, max_compounds=None):
+def process_category(category_name, input_base, output_base):
     """Process a single category to create compound images."""
     category_path = os.path.join(input_base, category_name)
     
@@ -139,7 +144,7 @@ def process_category(category_name, input_base, output_base, max_compounds=None)
     os.makedirs(single_dir, exist_ok=True)
     os.makedirs(compound_dir, exist_ok=True)
     
-    # Get all object folders
+    # Get all object folders and their images
     objects = {}
     for obj_name in os.listdir(category_path):
         obj_path = os.path.join(category_path, obj_name)
@@ -152,10 +157,10 @@ def process_category(category_name, input_base, output_base, max_compounds=None)
                     break
             
             if matching_key:
-                img_path = get_first_image(obj_path)
-                if img_path:
+                img_paths = get_all_images(obj_path)
+                if img_paths:
                     objects[matching_key] = {
-                        'path': img_path,
+                        'paths': img_paths,
                         'attribute': ATTRIBUTES[category_name][matching_key],
                         'name': obj_name
                     }
@@ -164,9 +169,28 @@ def process_category(category_name, input_base, output_base, max_compounds=None)
         print(f"Warning: Not enough objects found in '{category_name}'")
         return
     
-    # Generate valid pairs
+    # First, copy ALL single images to single directory
+    print(f"\n{category_name}: Copying all single images...")
+    single_counters = {}
+    all_single_images = {}
+    
+    for obj_key, obj in objects.items():
+        attr_obj_key = f"{obj['attribute']}_{obj['name']}"
+        single_counters[attr_obj_key] = 0
+        
+        for img_path in obj['paths']:
+            single_counters[attr_obj_key] += 1
+            single_filename = f"{obj['attribute']}_{obj['name']}_{single_counters[attr_obj_key]:03d}{Path(img_path).suffix}"
+            single_output = os.path.join(single_dir, single_filename)
+            Image.open(img_path).save(single_output)
+            all_single_images[img_path] = single_counters[attr_obj_key]
+    
+    total_singles = sum(len(obj['paths']) for obj in objects.values())
+    print(f"  Copied {total_singles} single images")
+    
+    # Generate all possible image pair combinations
     obj_keys = list(objects.keys())
-    valid_pairs = []
+    all_combinations = []
     
     for i, obj1_key in enumerate(obj_keys):
         for obj2_key in obj_keys[i+1:]:
@@ -175,46 +199,45 @@ def process_category(category_name, input_base, output_base, max_compounds=None)
             
             # Check if attributes are different enough
             if not are_attributes_similar(attr1, attr2, category_name):
-                valid_pairs.append((obj1_key, obj2_key))
+                # Create all combinations of images between these two objects
+                for img1_path in objects[obj1_key]['paths']:
+                    for img2_path in objects[obj2_key]['paths']:
+                        all_combinations.append({
+                            'obj1_key': obj1_key,
+                            'obj2_key': obj2_key,
+                            'img1_path': img1_path,
+                            'img2_path': img2_path
+                        })
     
-    # Shuffle and limit pairs
-    random.shuffle(valid_pairs)
-    if max_compounds:
-        valid_pairs = valid_pairs[:max_compounds]
-    
-    print(f"\n{category_name}: Creating {len(valid_pairs)} compound images")
-    
-    # Track which single images we've copied
-    copied_singles = set()
+    # Use ALL combinations (no limit)
+    print(f"  Creating {len(all_combinations)} compound images")
     
     # Create compound images
-    for obj1_key, obj2_key in valid_pairs:
+    compound_counter = 1
+    for idx, combo in enumerate(all_combinations):
+        obj1_key = combo['obj1_key']
+        obj2_key = combo['obj2_key']
         obj1 = objects[obj1_key]
         obj2 = objects[obj2_key]
-        
-        # Copy single images if not already copied
-        for obj_key, obj in [(obj1_key, obj1), (obj2_key, obj2)]:
-            if obj_key not in copied_singles:
-                single_filename = f"{obj['attribute']}_{obj['name']}{Path(obj['path']).suffix}"
-                single_output = os.path.join(single_dir, single_filename)
-                Image.open(obj['path']).save(single_output)
-                copied_singles.add(obj_key)
+        img1_path = combo['img1_path']
+        img2_path = combo['img2_path']
         
         # Create compound image
-        compound_filename = f"{obj1['attribute']}_{obj1['name']}_{obj2['attribute']}_{obj2['name']}.png"
+        compound_filename = f"{obj1['attribute']}_{obj1['name']}_{obj2['attribute']}_{obj2['name']}_{compound_counter:03d}.png"
         compound_output = os.path.join(compound_dir, compound_filename)
         
-        create_compound_image(obj1['path'], obj2['path'], compound_output)
-        print(f"  Created: {compound_filename}")
+        create_compound_image(img1_path, img2_path, compound_output)
+        compound_counter += 1
+        
+        if (idx + 1) % 100 == 0 or idx == len(all_combinations) - 1:
+            print(f"  Created {idx + 1}/{len(all_combinations)} compounds...")
 
 def main():
     parser = argparse.ArgumentParser(description='Generate compound images from object pairs')
-    parser.add_argument('--input', default='other-attributes-nobag', 
+    parser.add_argument('--input', default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/other-attrs-nobg', 
                         help='Input directory containing category folders')
-    parser.add_argument('--output', default='output', 
+    parser.add_argument('--output', default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/other-attributes', 
                         help='Output directory for results')
-    parser.add_argument('--max-compounds', type=int, default=None,
-                        help='Maximum number of compound images per category')
     
     args = parser.parse_args()
     
@@ -227,11 +250,10 @@ def main():
     print(f"Starting compound image generation...")
     print(f"Input directory: {input_base}")
     print(f"Output directory: {output_base}")
-    if args.max_compounds:
-        print(f"Max compounds per category: {args.max_compounds}")
+    print(f"Mode: Using ALL images and creating ALL valid compound combinations")
     
     for category in categories:
-        process_category(category, input_base, output_base, args.max_compounds)
+        process_category(category, input_base, output_base)
     
     print("\n✓ All compound images created successfully!")
 

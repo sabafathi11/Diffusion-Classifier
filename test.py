@@ -441,7 +441,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 
 # Load your existing image
-image_path = "folder1_apple_bed.png"
+image_path = "lab-coat.png"
 image_pil = Image.open(image_path).convert("RGB").resize((1024, 1024))
 
 model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
@@ -455,10 +455,10 @@ pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
 ).to(device)
 
 
-prompt = "a red apple and a bed"
+prompt = "a lab coat"
 gen = set_seed(0)
 
-label = 'red'
+label = 'lab'
 
 with torch.no_grad():
     with trace(pipe) as tc:
@@ -474,5 +474,5 @@ with torch.no_grad():
         heat_map = heat_map.compute_word_heat_map(label)
 
         heat_map.plot_overlay(out.images[0])
-        plt.savefig(f'heat_map_{label}2.png')
+        plt.savefig(f'heat_map_{label}.png')
 

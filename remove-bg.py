@@ -29,6 +29,16 @@ class BackgroundRemover:
     
     def remove_background(self, image: Image.Image) -> Image.Image:
         """Remove background from a PIL image and replace with white."""
+        # Convert to RGB FIRST (handles RGBA, LA, L, etc.)
+        if image.mode != 'RGB':
+            # If image has transparency, composite on white background first
+            if image.mode in ('RGBA', 'LA'):
+                background = Image.new('RGB', image.size, (255, 255, 255))
+                background.paste(image, mask=image.split()[-1])  # Use alpha channel as mask
+                image = background
+            else:
+                image = image.convert('RGB')
+        
         image_size = image.size
         input_images = self.transform_image(image).unsqueeze(0).to(self.device)
         
@@ -38,10 +48,6 @@ class BackgroundRemover:
         pred = preds[0].squeeze()
         pred_pil = torch_transforms.ToPILImage()(pred)
         mask = pred_pil.resize(image_size)
-        
-        # Convert to RGB if not already
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
         
         # Create white background
         white_background = Image.new('RGB', image_size, (255, 255, 255))
@@ -73,6 +79,10 @@ def process_directory(input_dir, output_dir, bg_remover):
     
     print(f"Found {len(png_files)} PNG images to process")
     
+    # Track statistics
+    success_count = 0
+    error_count = 0
+    
     # Process each image
     for img_path in tqdm(png_files, desc="Processing images"):
         # Calculate relative path from input_dir
@@ -93,18 +103,23 @@ def process_directory(input_dir, output_dir, bg_remover):
             
             # Save result
             result.save(output_img_path)
+            success_count += 1
             
         except Exception as e:
             print(f"\nError processing {img_path}: {e}")
+            error_count += 1
             continue
     
-    print(f"\nProcessing complete! Results saved to {output_dir}")
+    print(f"\nProcessing complete!")
+    print(f"Successfully processed: {success_count}/{len(png_files)}")
+    print(f"Errors: {error_count}/{len(png_files)}")
+    print(f"Results saved to {output_dir}")
 
 
 def main():
     # Configuration
-    input_directory = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/other-attributes"
-    output_directory = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/other-attributes-nobg"
+    input_directory = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/other-attrs"
+    output_directory = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/other-attrs-nobg"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"Using device: {device}")

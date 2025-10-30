@@ -34,7 +34,7 @@ INTERPOLATIONS = {
     'lanczos': InterpolationMode.LANCZOS,
 }
 
-# Attribute definitions for each category
+# Define attributes for each object in each category
 ATTRIBUTES = {
     "Part-Whole": {
         "Tree": "leafy",
@@ -49,16 +49,16 @@ ATTRIBUTES = {
         "Cat": "tailed"
     },
     "Shape": {
-        "Ball": "round",
-        "Box": "square",
+        "Ball": "circular",
         "Plate": "circular",
-        "Clock": "round",
-        "Window": "rectangular",
+        "Clock": "circular",
         "Wheel": "circular",
-        "Dice": "cubic",
-        "Coin": "round",
+        "Coin": "circular",
+        "Box": "rectangular",
+        "Window": "rectangular",
         "Book": "rectangular",
-        "Table": "rectangular"
+        "Table": "rectangular",
+        "Door": "rectangular"
     },
     "Material & Texture": {
         "Table": "wooden",
@@ -74,14 +74,14 @@ ATTRIBUTES = {
     },
     "Size": {
         "Elephant": "big",
+        "Whale": "big",
+        "Truck": "big",
+        "Building": "big",
+        "wind turbine": "big",
         "Ant": "small",
-        "Whale": "huge",
         "Mouse": "small",
-        "wind turbine": "tall",
-        "Pebble": "tiny",
-        "Truck": "large",
+        "Pebble": "small",
         "Key": "small",
-        "Building": "tall",
         "Bird": "small"
     },
     "Temperature": {
@@ -97,6 +97,46 @@ ATTRIBUTES = {
         "Ice cream": "cold"
     }
 }
+
+# Define similar attributes that shouldn't be paired
+SIMILAR_ATTRIBUTES = {
+    "Part-Whole": [
+        {"leafy","petaled"},
+        {"feathered", "finned"},
+    ],
+    "Shape": [
+        {"circular"},
+        {"rectangular"}
+    ],
+    "Size": [
+        {"big"},
+        {"small"}
+    ],
+    "Temperature": [
+        {"hot"},
+        {"cold"}
+    ]
+}
+
+def are_attributes_similar(attr1, attr2, category):
+    """Check if two attributes are too similar to be paired."""
+    if attr1 == attr2:
+        return True
+    
+    if category in SIMILAR_ATTRIBUTES:
+        for group in SIMILAR_ATTRIBUTES[category]:
+            if attr1 in group and attr2 in group:
+                return True
+    
+    return False
+
+def get_dissimilar_attributes(target_attr, all_attributes, category):
+    """Get only attributes that are dissimilar to the target attribute."""
+    dissimilar = []
+    for attr in all_attributes:
+        if not are_attributes_similar(target_attr, attr, category):
+            dissimilar.append(attr)
+    return dissimilar
 
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
@@ -233,14 +273,19 @@ class DiffusionEvaluator:
         # Get all unique attributes for this category
         self.all_attributes = sorted(set(ATTRIBUTES[category].values()))
         
+        # Get all unique objects for this category
+        self.all_objects = sorted(set(ATTRIBUTES[category].keys()))
+        
         # Initialize tracking variables
         self.correct_predictions = 0
         self.other_object_predictions = 0
         self.other_mistakes = 0
         self.total_classifications = 0
         
-        # Confusion matrix for single mode
+        # Per-object tracking for single mode
         if self.mode == 'single':
+            self.per_object_stats = {obj: {'correct': 0, 'incorrect': 0, 'total': 0} 
+                                    for obj in self.all_objects}
             self.confusion_matrix = np.zeros((len(self.all_attributes), len(self.all_attributes)), dtype=int)
             self.attr_to_idx = {attr: idx for idx, attr in enumerate(self.all_attributes)}
         
@@ -294,16 +339,28 @@ class DiffusionEvaluator:
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
-    def create_attribute_prompts(self, target_object):
-        """Create prompts for all attributes for a specific object"""
+    def create_attribute_prompts(self, target_object, correct_attr):
+        """Create prompts for dissimilar attributes only"""
+        # Get dissimilar attributes
+        dissimilar_attrs = get_dissimilar_attributes(correct_attr, self.all_attributes, self.category)
+        
+        # Always include the correct attribute
+        if correct_attr not in dissimilar_attrs:
+            dissimilar_attrs.append(correct_attr)
+        
         prompts = []
-        for attr in self.all_attributes:
+        prompt_attributes = []
+        for attr in dissimilar_attrs:
             if self.mode == 'compound':
                 prompt = f"A {attr.lower()} {target_object.lower()} and another object."
             else:
                 prompt = f"A {attr.lower()} {target_object.lower()}."
             prompts.append(prompt)
-        return prompts
+            prompt_attributes.append(attr)
+        
+        print(f"\nEvaluating with dissimilar attributes for '{correct_attr}': {prompt_attributes}")
+        
+        return prompts, prompt_attributes
 
     def classify_prediction(self, predicted_attr, correct_attr, other_object_attr=None):
         """Classify the type of prediction made"""
@@ -345,7 +402,7 @@ class DiffusionEvaluator:
         return pred_errors
 
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, target_object, 
-                        latent_size=64, all_noise=None, prompts=None):
+                        latent_size=64, all_noise=None, prompts=None, prompt_attributes=None):
         scheduler_config = get_scheduler_config(args)
         T = scheduler_config['num_train_timesteps']
         max_n_samples = max(args.n_samples)
@@ -405,7 +462,7 @@ class DiffusionEvaluator:
 
     def perform_attribute_classification_compound(self, image, obj1, obj2, target_object, target_attr, other_object_attr):
         """Perform attribute classification for a specific object in compound image"""
-        prompts = self.create_attribute_prompts(target_object)
+        prompts, prompt_attributes = self.create_attribute_prompts(target_object, target_attr)
         
         text_input = self.tokenizer(prompts, padding="max_length",
                             max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
@@ -422,10 +479,10 @@ class DiffusionEvaluator:
         all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
             self.unet, x0, text_embeddings, self.scheduler, 
             self.args, img_input, target_object, self.latent_size, self.all_noise,
-            prompts=prompts
+            prompts=prompts, prompt_attributes=prompt_attributes
         )
         
-        predicted_attr = self.all_attributes[pred_idx]
+        predicted_attr = prompt_attributes[pred_idx]
         correct_attr = target_attr
         
         prediction_type = self.classify_prediction(predicted_attr, correct_attr, other_object_attr)
@@ -434,7 +491,8 @@ class DiffusionEvaluator:
 
     def perform_attribute_classification_single(self, image, obj, target_attr):
         """Perform attribute classification for a single object image"""
-        prompts = self.create_attribute_prompts(obj)
+        prompts, prompt_attributes = self.create_attribute_prompts(obj, target_attr)
+        print('prompts:', prompts)
         
         text_input = self.tokenizer(prompts, padding="max_length",
                             max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt")
@@ -450,11 +508,17 @@ class DiffusionEvaluator:
 
         all_losses, pred_idx, pred_errors = self.eval_prob_adaptive(
             self.unet, x0, text_embeddings, self.scheduler, 
-            self.args, img_input, obj, self.latent_size, self.all_noise, prompts=prompts
+            self.args, img_input, obj, self.latent_size, self.all_noise, 
+            prompts=prompts, prompt_attributes=prompt_attributes
         )
         
-        predicted_attr = self.all_attributes[pred_idx]
+        predicted_attr = prompt_attributes[pred_idx]
         correct_attr = target_attr
+
+        print('obj:', obj)
+        print('prompt_attributes:', prompt_attributes)
+        print('correct_attr:', correct_attr)
+        print('predicted_attr', predicted_attr)
         
         prediction_type = self.classify_prediction(predicted_attr, correct_attr, None)
         
@@ -523,6 +587,54 @@ class DiffusionEvaluator:
         
         print(f"Per-attribute metrics saved to {metrics_path}")
 
+    def save_per_object_metrics(self):
+        """Save per-object metrics for single mode"""
+        if self.mode != 'single':
+            return
+        
+        metrics_path = osp.join(self.run_folder, 'per_object_metrics.txt')
+        with open(metrics_path, 'w') as f:
+            f.write(f"Per-Object Metrics - {self.category}\n")
+            f.write("=" * 70 + "\n\n")
+            
+            # Sort objects by total count for better readability
+            sorted_objects = sorted(self.per_object_stats.items(), 
+                                   key=lambda x: x[1]['total'], reverse=True)
+            
+            for obj, stats in sorted_objects:
+                if stats['total'] == 0:
+                    continue
+                    
+                accuracy = (stats['correct'] / stats['total'] * 100) if stats['total'] > 0 else 0
+                
+                f.write(f"{obj.upper()}:\n")
+                f.write(f"  Total images: {stats['total']}\n")
+                f.write(f"  Correct predictions: {stats['correct']}\n")
+                f.write(f"  Incorrect predictions: {stats['incorrect']}\n")
+                f.write(f"  Accuracy: {accuracy:.2f}%\n\n")
+        
+        print(f"Per-object metrics saved to {metrics_path}")
+        
+        # Also save as CSV for easy analysis
+        csv_data = []
+        for obj, stats in self.per_object_stats.items():
+            if stats['total'] > 0:
+                accuracy = (stats['correct'] / stats['total'] * 100)
+                csv_data.append({
+                    'Object': obj,
+                    'Total': stats['total'],
+                    'Correct': stats['correct'],
+                    'Incorrect': stats['incorrect'],
+                    'Accuracy (%)': f"{accuracy:.2f}"
+                })
+        
+        if csv_data:
+            df = pd.DataFrame(csv_data)
+            df = df.sort_values('Total', ascending=False)
+            csv_path = osp.join(self.run_folder, 'per_object_metrics.csv')
+            df.to_csv(csv_path, index=False)
+            print(f"Per-object metrics CSV saved to {csv_path}")
+
     def save_results_summary(self):
         """Save a summary of attribute classification results."""
         summary_path = osp.join(self.run_folder, 'results_summary.txt')
@@ -545,6 +657,18 @@ class DiffusionEvaluator:
                 else:
                     other_mistakes_acc = (self.other_mistakes / self.total_classifications * 100)
                     f.write(f"Incorrect predictions: {self.other_mistakes} ({other_mistakes_acc:.2f}%)\n\n")
+                    
+                    # Add per-object summary in results
+                    f.write(f"Per-Object Breakdown:\n")
+                    f.write("-" * 70 + "\n")
+                    sorted_objects = sorted(self.per_object_stats.items(), 
+                                           key=lambda x: x[1]['total'], reverse=True)
+                    for obj, stats in sorted_objects:
+                        if stats['total'] > 0:
+                            obj_acc = (stats['correct'] / stats['total'] * 100)
+                            f.write(f"  {obj}: {stats['correct']}/{stats['total']} correct ({obj_acc:.2f}%), "
+                                   f"{stats['incorrect']} incorrect\n")
+                    f.write("\n")
             else:
                 f.write(f"No classifications performed.\n\n")
             
@@ -590,6 +714,11 @@ class DiffusionEvaluator:
             
             if not attr1 or not attr2:
                 print(f"Skipping {image_path}: Missing attributes")
+                continue
+            
+            # Check if attributes are too similar - skip if they are
+            if are_attributes_similar(attr1, attr2, self.category):
+                print(f"Skipping {image_path}: Attributes too similar ({attr1}, {attr2})")
                 continue
             
             for obj_idx, target_object in enumerate([obj1, obj2]):
@@ -668,11 +797,20 @@ class DiffusionEvaluator:
                     prediction_type = data['prediction_type']
                     predicted_attr = data['predicted_attr']
                     correct_attr = data['correct_attr']
+                    target_object = data['target_object']
                     
                     # Update confusion matrix
                     true_idx = self.attr_to_idx[correct_attr]
                     pred_idx = self.attr_to_idx[predicted_attr]
                     self.confusion_matrix[true_idx, pred_idx] += 1
+                    
+                    # Update per-object stats
+                    if target_object in self.per_object_stats:
+                        self.per_object_stats[target_object]['total'] += 1
+                        if prediction_type == 'correct':
+                            self.per_object_stats[target_object]['correct'] += 1
+                        else:
+                            self.per_object_stats[target_object]['incorrect'] += 1
                     
                     if prediction_type == 'correct':
                         self.correct_predictions += 1
@@ -688,6 +826,14 @@ class DiffusionEvaluator:
             true_idx = self.attr_to_idx[correct_attr]
             pred_idx_cm = self.attr_to_idx[predicted_attr]
             self.confusion_matrix[true_idx, pred_idx_cm] += 1
+            
+            # Update per-object stats
+            if obj in self.per_object_stats:
+                self.per_object_stats[obj]['total'] += 1
+                if prediction_type == 'correct':
+                    self.per_object_stats[obj]['correct'] += 1
+                else:
+                    self.per_object_stats[obj]['incorrect'] += 1
             
             if prediction_type == 'correct':
                 self.correct_predictions += 1
@@ -719,9 +865,10 @@ class DiffusionEvaluator:
         # Generate summary
         self.save_results_summary()
         
-        # Save confusion matrix for single mode
+        # Save confusion matrix and per-object metrics for single mode
         if self.mode == 'single':
             self.save_confusion_matrix()
+            self.save_per_object_metrics()
         
         # Print final results
         if self.total_classifications > 0:
@@ -745,21 +892,21 @@ def main():
 
     # dataset args
     parser.add_argument('--data_folder', type=str,
-                        default='output',
+                        default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/other-attributes',
                         help='Path to output folder containing category folders')
     parser.add_argument('--categories', nargs='+', 
-                        default=['Part-Whole', 'Shape', 'Material & Texture', 'Size', 'Temperature'],
+                        default=['Temperature'],
                         choices=['Part-Whole', 'Shape', 'Material & Texture', 'Size', 'Temperature'],
                         help='Categories to evaluate')
     parser.add_argument('--modes', nargs='+',
-                        default=['single', 'compound'],
+                        default=['single'],
                         choices=['single', 'compound'],
                         help='Modes to evaluate (single, compound, or both)')
     
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
-    parser.add_argument('--batch_size', '-b', type=int, default=1, help='Batch size')
+    parser.add_argument('--batch_size', '-b', type=int, default=32, help='Batch size')
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
@@ -771,7 +918,7 @@ def main():
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', default=[1], type=int)
-    parser.add_argument('--n_samples', nargs='+', default=[5], type=int)
+    parser.add_argument('--n_samples', nargs='+', default=[50], type=int)
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
@@ -814,6 +961,8 @@ def main():
                 
             except Exception as e:
                 print(f"Error evaluating {category} - {mode}: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 continue
 
     # Save summary of all results
