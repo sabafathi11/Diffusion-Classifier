@@ -39,26 +39,26 @@ ATTRIBUTES = {
     "Part-Whole": {
         "Tree": "leafy",
         "Car": "wheeled",
-        "bird": "feathered",
-        "fish": "finned",
+        "Bird": "feathered", 
+        "Fish": "finned", 
         "House": "windowed",
         "Airplane": "winged",
         "Flower": "petaled",
-        "book": "paged",
+        "Book": "paged", 
         "Chair": "legged",
         "Cat": "tailed"
     },
     "Shape": {
-        "Ball": "circular",
-        "Plate": "circular",
-        "Clock": "circular",
-        "Wheel": "circular",
-        "Coin": "circular",
-        "Box": "rectangular",
-        "Window": "rectangular",
-        "Book": "rectangular",
-        "Table": "rectangular",
-        "Door": "rectangular"
+        "Ball": "round",
+        "Plate": "round",
+        "Clock": "round",
+        "Wheel": "round",
+        "Coin": "round",
+        "Box": "square",
+        "Window": "square",
+        "Book": "square",
+        "Table": "square",
+        "Dice": "square"
     },
     "Material & Texture": {
         "Table": "wooden",
@@ -77,7 +77,7 @@ ATTRIBUTES = {
         "Whale": "big",
         "Truck": "big",
         "Building": "big",
-        "wind turbine": "big",
+        "Wind turbine": "big",
         "Ant": "small",
         "Mouse": "small",
         "Pebble": "small",
@@ -92,8 +92,8 @@ ATTRIBUTES = {
         "Water bottle": "cold",
         "Juice": "cold",
         "Fireplace": "hot",
-        "stove": "hot",
-        "engine": "hot",
+        "Stove": "hot", 
+        "Engine": "hot",
         "Ice cream": "cold"
     }
 }
@@ -117,6 +117,14 @@ SIMILAR_ATTRIBUTES = {
         {"cold"}
     ]
 }
+
+def normalize_name(name):
+    """Normalize a name for comparison (lowercase, replace underscores with spaces)."""
+    return name.lower().replace('_', ' ').strip()
+
+def sanitize_filename(name):
+    """Convert name to safe filename format (replace spaces with underscores)."""
+    return name.replace(' ', '_')
 
 def are_attributes_similar(attr1, attr2, category):
     """Check if two attributes are too similar to be paired."""
@@ -164,54 +172,107 @@ def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     ])
     return transform
 
-def parse_compound_filename(filename, category):
-    """
-    Parse compound filename to extract object names and attributes.
-    Expected format: attribute1_object1_attribute2_object2.png
-    Example: leafy_Tree_wheeled_Car.png
+def create_lookup_tables(category):
+    """Create bidirectional lookup tables for objects and attributes."""
+    obj_lookup = {}
+    attr_lookup = {}
+    obj_to_attr = {}
+    attr_to_objs = defaultdict(list)
     
-    Returns: (object1, attr1, object2, attr2) or None if parsing fails
-    """
-    name = filename.replace('.png', '').replace('.jpg', '')
+    for obj_key, attr_val in ATTRIBUTES[category].items():
+        obj_normalized = normalize_name(obj_key)
+        attr_normalized = normalize_name(attr_val)
+        
+        obj_lookup[obj_normalized] = obj_key
+        attr_lookup[attr_normalized] = attr_val
+        obj_to_attr[obj_key] = attr_val
+        attr_to_objs[attr_val].append(obj_key)
+    
+    return obj_lookup, attr_lookup, obj_to_attr, attr_to_objs
+
+
+def parse_compound_filename(filename, category, obj_lookup, attr_lookup):
+    """Parse compound filename to extract object names and attributes."""
+    name = filename.replace('.png', '').replace('.jpg', '').replace('.jpeg', '')
     parts = name.split('_')
     
-    # Try to match against known attributes in the category
-    if len(parts) >= 4:
-        attr1 = parts[0]
-        obj1 = parts[1]
-        attr2 = parts[2]
-        obj2 = parts[3]
+    # Remove trailing number if present
+    if parts[-1].isdigit():
+        parts = parts[:-1]
+    
+    if len(parts) < 4:
+        return None
+    
+    # Try to parse as: attr1_obj1_attr2_obj2
+    # We need to find the split point between the two object-attribute pairs
+    for split_point in range(2, len(parts) - 1):
+        # First pair: parts[0:split_point]
+        attr1_norm = normalize_name(parts[0])
+        attr1 = attr_lookup.get(attr1_norm)
         
-        # Verify this matches the category's attributes
-        if category in ATTRIBUTES:
-            for obj_key, attr_val in ATTRIBUTES[category].items():
-                if obj1.lower() == obj_key.lower() and attr1.lower() == attr_val.lower():
-                    for obj_key2, attr_val2 in ATTRIBUTES[category].items():
-                        if obj2.lower() == obj_key2.lower() and attr2.lower() == attr_val2.lower():
-                            return obj1, attr1, obj2, attr2
+        if not attr1:
+            continue
+        
+        # Try to match object1 from parts[1:split_point]
+        obj1 = None
+        for i in range(split_point, 1, -1):
+            potential_obj1 = '_'.join(parts[1:i])
+            obj1_norm = normalize_name(potential_obj1)
+            obj1 = obj_lookup.get(obj1_norm)
+            if obj1:
+                attr2_start = i
+                break
+        
+        if not obj1:
+            continue
+        
+        # Second pair: parts[attr2_start:]
+        attr2_norm = normalize_name(parts[attr2_start])
+        attr2 = attr_lookup.get(attr2_norm)
+        
+        if not attr2:
+            continue
+        
+        # Try to match object2 from remaining parts
+        for i in range(len(parts), attr2_start + 1, -1):
+            potential_obj2 = '_'.join(parts[attr2_start + 1:i])
+            obj2_norm = normalize_name(potential_obj2)
+            obj2 = obj_lookup.get(obj2_norm)
+            
+            if obj2:
+                return obj1, attr1, obj2, attr2
     
     return None
 
-def parse_single_filename(filename, category):
-    """
-    Parse single filename to extract object name and attribute.
-    Expected format: attribute_object_*.png
-    Example: leafy_Tree_02_20251023.png
-    
-    Returns: (object, attribute) or None if parsing fails
-    """
-    name = filename.replace('.png', '').replace('.jpg', '')
+
+def parse_single_filename(filename, category, obj_lookup, attr_lookup):
+    """Parse single filename to extract object name and attribute."""
+    name = filename.replace('.png', '').replace('.jpg', '').replace('.jpeg', '')
     parts = name.split('_')
     
-    if len(parts) >= 2:
-        attr = parts[0]
-        obj = parts[1]
+    # Remove trailing number if present
+    if parts[-1].isdigit():
+        parts = parts[:-1]
+    
+    if len(parts) < 2:
+        return None
+    
+    # First part should be the attribute
+    attr_norm = normalize_name(parts[0])
+    attr = attr_lookup.get(attr_norm)
+    
+    if not attr:
+        return None
+    
+    # Try to match the remaining parts as an object name
+    # Start with all remaining parts, then try progressively fewer
+    for i in range(len(parts), 1, -1):
+        potential_obj = '_'.join(parts[1:i])
+        obj_norm = normalize_name(potential_obj)
+        obj = obj_lookup.get(obj_norm)
         
-        # Verify this matches the category's attributes
-        if category in ATTRIBUTES:
-            for obj_key, attr_val in ATTRIBUTES[category].items():
-                if obj.lower() == obj_key.lower() and attr.lower() == attr_val.lower():
-                    return obj, attr
+        if obj:
+            return obj, attr
     
     return None
 
@@ -224,11 +285,15 @@ class AttributeDataset:
         self.transform = transform
         self.image_paths = []
         
+        self.obj_lookup, self.attr_lookup, self.obj_to_attr, self.attr_to_objs = create_lookup_tables(category)
+        
         category_path = osp.join(root_dir, category, mode)
         
         if osp.exists(category_path):
             self.image_paths = glob.glob(osp.join(category_path, "*.jpg"))
             self.image_paths += glob.glob(osp.join(category_path, "*.png"))
+            self.image_paths += glob.glob(osp.join(category_path, "*.jpeg"))
+            self.image_paths = sorted(self.image_paths)
         
         print(f"Found {len(self.image_paths)} {mode} images in {category}")
         
@@ -245,7 +310,7 @@ class AttributeDataset:
         filename = osp.basename(image_path)
         
         if self.mode == 'compound':
-            parsed = parse_compound_filename(filename, self.category)
+            parsed = parse_compound_filename(filename, self.category, self.obj_lookup, self.attr_lookup)
             if parsed is None:
                 print(f"Warning: Could not parse compound filename {filename}")
                 return image, [], {}, image_path
@@ -254,14 +319,15 @@ class AttributeDataset:
             objects = [obj1, obj2]
             attributes = {obj1: attr1, obj2: attr2}
             return image, objects, attributes, image_path
-        else:  # single
-            parsed = parse_single_filename(filename, self.category)
+        else:
+            parsed = parse_single_filename(filename, self.category, self.obj_lookup, self.attr_lookup)
             if parsed is None:
                 print(f"Warning: Could not parse single filename {filename}")
                 return image, [], None, image_path
             
             obj, attr = parsed
             return image, [obj], attr, image_path
+
 
 class DiffusionEvaluator:
     def __init__(self, args, category, mode):
@@ -270,19 +336,16 @@ class DiffusionEvaluator:
         self.mode = mode
         self.device = device
         
-        # Get all unique attributes for this category
-        self.all_attributes = sorted(set(ATTRIBUTES[category].values()))
+        self.obj_lookup, self.attr_lookup, self.obj_to_attr, self.attr_to_objs = create_lookup_tables(category)
         
-        # Get all unique objects for this category
+        self.all_attributes = sorted(set(ATTRIBUTES[category].values()))
         self.all_objects = sorted(set(ATTRIBUTES[category].keys()))
         
-        # Initialize tracking variables
         self.correct_predictions = 0
         self.other_object_predictions = 0
         self.other_mistakes = 0
         self.total_classifications = 0
         
-        # Per-object tracking for single mode
         if self.mode == 'single':
             self.per_object_stats = {obj: {'correct': 0, 'incorrect': 0, 'total': 0} 
                                     for obj in self.all_objects}
@@ -339,12 +402,15 @@ class DiffusionEvaluator:
         os.makedirs(self.run_folder, exist_ok=True)
         print(f'Run folder: {self.run_folder}')
 
+    def normalize_object_name(self, obj_name):
+        """Normalize object name to match the canonical form in ATTRIBUTES"""
+        obj_normalized = normalize_name(obj_name)
+        return self.obj_lookup.get(obj_normalized, obj_name)
+
     def create_attribute_prompts(self, target_object, correct_attr):
         """Create prompts for dissimilar attributes only"""
-        # Get dissimilar attributes
         dissimilar_attrs = get_dissimilar_attributes(correct_attr, self.all_attributes, self.category)
         
-        # Always include the correct attribute
         if correct_attr not in dissimilar_attrs:
             dissimilar_attrs.append(correct_attr)
         
@@ -529,13 +595,11 @@ class DiffusionEvaluator:
         if self.mode != 'single':
             return
         
-        # Save as CSV
         df = pd.DataFrame(self.confusion_matrix, index=self.all_attributes, columns=self.all_attributes)
         csv_path = osp.join(self.run_folder, 'confusion_matrix.csv')
         df.to_csv(csv_path)
         print(f"Confusion matrix saved to {csv_path}")
         
-        # Create visualization
         plt.figure(figsize=(12, 10))
         sns.heatmap(self.confusion_matrix, annot=True, fmt='d', cmap='Blues',
                     xticklabels=self.all_attributes, yticklabels=self.all_attributes,
@@ -545,13 +609,11 @@ class DiffusionEvaluator:
         plt.title(f'Attribute Classification Confusion Matrix - {self.category}')
         plt.tight_layout()
         
-        # Save figure
         fig_path = osp.join(self.run_folder, 'confusion_matrix.png')
         plt.savefig(fig_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"Confusion matrix visualization saved to {fig_path}")
         
-        # Calculate and save per-attribute metrics
         metrics_path = osp.join(self.run_folder, 'per_attribute_metrics.txt')
         with open(metrics_path, 'w') as f:
             f.write(f"Per-Attribute Metrics - {self.category}\n")
@@ -563,20 +625,9 @@ class DiffusionEvaluator:
                 false_negatives = self.confusion_matrix[i, :].sum() - true_positives
                 total_true = self.confusion_matrix[i, :].sum()
                 
-                if total_true > 0:
-                    recall = true_positives / total_true * 100
-                else:
-                    recall = 0.0
-                
-                if (true_positives + false_positives) > 0:
-                    precision = true_positives / (true_positives + false_positives) * 100
-                else:
-                    precision = 0.0
-                
-                if (precision + recall) > 0:
-                    f1 = 2 * (precision * recall) / (precision + recall)
-                else:
-                    f1 = 0.0
+                recall = (true_positives / total_true * 100) if total_true > 0 else 0.0
+                precision = (true_positives / (true_positives + false_positives) * 100) if (true_positives + false_positives) > 0 else 0.0
+                f1 = (2 * (precision * recall) / (precision + recall)) if (precision + recall) > 0 else 0.0
                 
                 f.write(f"{attr.upper()}:\n")
                 f.write(f"  Total samples: {total_true}\n")
@@ -597,7 +648,6 @@ class DiffusionEvaluator:
             f.write(f"Per-Object Metrics - {self.category}\n")
             f.write("=" * 70 + "\n\n")
             
-            # Sort objects by total count for better readability
             sorted_objects = sorted(self.per_object_stats.items(), 
                                    key=lambda x: x[1]['total'], reverse=True)
             
@@ -615,7 +665,6 @@ class DiffusionEvaluator:
         
         print(f"Per-object metrics saved to {metrics_path}")
         
-        # Also save as CSV for easy analysis
         csv_data = []
         for obj, stats in self.per_object_stats.items():
             if stats['total'] > 0:
@@ -658,7 +707,6 @@ class DiffusionEvaluator:
                     other_mistakes_acc = (self.other_mistakes / self.total_classifications * 100)
                     f.write(f"Incorrect predictions: {self.other_mistakes} ({other_mistakes_acc:.2f}%)\n\n")
                     
-                    # Add per-object summary in results
                     f.write(f"Per-Object Breakdown:\n")
                     f.write("-" * 70 + "\n")
                     sorted_objects = sorted(self.per_object_stats.items(), 
@@ -716,7 +764,6 @@ class DiffusionEvaluator:
                 print(f"Skipping {image_path}: Missing attributes")
                 continue
             
-            # Check if attributes are too similar - skip if they are
             if are_attributes_similar(attr1, attr2, self.category):
                 print(f"Skipping {image_path}: Attributes too similar ({attr1}, {attr2})")
                 continue
@@ -768,7 +815,7 @@ class DiffusionEvaluator:
                     image_path=image_path,
                     classification_idx=classification_idx
                 ), fname)
-
+    
     def run_evaluation_single(self):
         """Run evaluation for single images"""
         idxs_to_eval = list(range(len(self.target_dataset)))
@@ -786,54 +833,54 @@ class DiffusionEvaluator:
             if len(objects) != 1 or not attribute:
                 print(f"Skipping {image_path}: Invalid data")
                 continue
-                
-            obj = objects[0]
+            
+            obj = self.normalize_object_name(objects[0])
             
             fname = osp.join(self.run_folder, formatstr.format(i) + '.pt')
             
             if os.path.exists(fname):
-                if self.args.load_stats:
-                    data = torch.load(fname)
-                    prediction_type = data['prediction_type']
-                    predicted_attr = data['predicted_attr']
-                    correct_attr = data['correct_attr']
-                    target_object = data['target_object']
-                    
-                    # Update confusion matrix
-                    true_idx = self.attr_to_idx[correct_attr]
-                    pred_idx = self.attr_to_idx[predicted_attr]
-                    self.confusion_matrix[true_idx, pred_idx] += 1
-                    
-                    # Update per-object stats
-                    if target_object in self.per_object_stats:
-                        self.per_object_stats[target_object]['total'] += 1
-                        if prediction_type == 'correct':
-                            self.per_object_stats[target_object]['correct'] += 1
-                        else:
-                            self.per_object_stats[target_object]['incorrect'] += 1
-                    
+                data = torch.load(fname)
+                prediction_type = data['prediction_type']
+                predicted_attr = data['predicted_attr']
+                correct_attr = data['correct_attr']
+                target_object = self.normalize_object_name(data['target_object'])
+                
+                true_idx = self.attr_to_idx[correct_attr]
+                pred_idx = self.attr_to_idx[predicted_attr]
+                self.confusion_matrix[true_idx, pred_idx] += 1
+                
+                if target_object in self.per_object_stats:
+                    self.per_object_stats[target_object]['total'] += 1
                     if prediction_type == 'correct':
-                        self.correct_predictions += 1
+                        self.per_object_stats[target_object]['correct'] += 1
                     else:
-                        self.other_mistakes += 1
-                    self.total_classifications += 1
+                        self.per_object_stats[target_object]['incorrect'] += 1
+                else:
+                    print(f"Warning: Object '{target_object}' not found in per_object_stats")
+                
+                if prediction_type == 'correct':
+                    self.correct_predictions += 1
+                else:
+                    self.other_mistakes += 1
+                self.total_classifications += 1
+                
                 continue
             
             predicted_attr, correct_attr, prediction_type, prompts, pred_idx = \
                 self.perform_attribute_classification_single(image, obj, attribute)
             
-            # Update confusion matrix
             true_idx = self.attr_to_idx[correct_attr]
             pred_idx_cm = self.attr_to_idx[predicted_attr]
             self.confusion_matrix[true_idx, pred_idx_cm] += 1
             
-            # Update per-object stats
             if obj in self.per_object_stats:
                 self.per_object_stats[obj]['total'] += 1
                 if prediction_type == 'correct':
                     self.per_object_stats[obj]['correct'] += 1
                 else:
                     self.per_object_stats[obj]['incorrect'] += 1
+            else:
+                print(f"Warning: Object '{obj}' not found in per_object_stats")
             
             if prediction_type == 'correct':
                 self.correct_predictions += 1
@@ -862,15 +909,12 @@ class DiffusionEvaluator:
         else:
             self.run_evaluation_single()
         
-        # Generate summary
         self.save_results_summary()
         
-        # Save confusion matrix and per-object metrics for single mode
         if self.mode == 'single':
             self.save_confusion_matrix()
             self.save_per_object_metrics()
         
-        # Print final results
         if self.total_classifications > 0:
             correct_acc = 100 * self.correct_predictions / self.total_classifications
             print(f"\nFinal Results - {self.category} ({self.mode.title()} Mode):")
@@ -890,20 +934,18 @@ class DiffusionEvaluator:
 def main():
     parser = argparse.ArgumentParser()
 
-    # dataset args
     parser.add_argument('--data_folder', type=str,
                         default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/other-attributes',
                         help='Path to output folder containing category folders')
     parser.add_argument('--categories', nargs='+', 
-                        default=['Temperature'],
+                        default=['Part-Whole', 'Shape', 'Material & Texture', 'Size', 'Temperature'],
                         choices=['Part-Whole', 'Shape', 'Material & Texture', 'Size', 'Temperature'],
                         help='Categories to evaluate')
     parser.add_argument('--modes', nargs='+',
-                        default=['single'],
+                        default=['single', 'compound'],
                         choices=['single', 'compound'],
                         help='Modes to evaluate (single, compound, or both)')
     
-    # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
     parser.add_argument('--batch_size', '-b', type=int, default=32, help='Batch size')
@@ -916,17 +958,14 @@ def main():
     parser.add_argument('--load_stats', action='store_true', help='Load saved stats to compute acc')
     parser.add_argument('--loss', type=str, default='l1', choices=('l1', 'l2', 'huber'), help='Type of loss to use')
 
-    # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', default=[1], type=int)
     parser.add_argument('--n_samples', nargs='+', default=[50], type=int)
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
 
-    # Summary results across all categories and modes
     all_results = []
 
-    # Run evaluation for each category and mode combination
     for category in args.categories:
         for mode in args.modes:
             print(f"\n{'='*70}")
@@ -942,7 +981,6 @@ def main():
                 
                 evaluator.run_evaluation()
                 
-                # Collect results
                 result = {
                     'category': category,
                     'mode': mode,
@@ -965,7 +1003,6 @@ def main():
                 traceback.print_exc()
                 continue
 
-    # Save summary of all results
     if all_results:
         summary_file = osp.join(LOG_DIR, 'Attributes' if args.extra is None else f'Attributes_{args.extra}', 'overall_summary.txt')
         os.makedirs(osp.dirname(summary_file), exist_ok=True)
@@ -988,7 +1025,6 @@ def main():
         
         print(f"\n\nOverall summary saved to {summary_file}")
         
-        # Create summary table
         print("\n" + "=" * 70)
         print("OVERALL RESULTS SUMMARY")
         print("=" * 70)
@@ -1007,7 +1043,6 @@ def main():
         df = pd.DataFrame(df_data)
         print(df.to_string(index=False))
         
-        # Save as CSV
         csv_file = osp.join(LOG_DIR, 'Attributes' if args.extra is None else f'Attributes_{args.extra}', 'overall_summary.csv')
         df.to_csv(csv_file, index=False)
         print(f"\nOverall summary CSV saved to {csv_file}")
