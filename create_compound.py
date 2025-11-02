@@ -69,14 +69,86 @@ ATTRIBUTES = {
 }
 
 # Define similar attributes that shouldn't be paired
+# Define attributes for each object in each category
+ATTRIBUTES = {
+    "Part-Whole": {
+        "Tree": "leafy",
+        "Car": "wheeled",
+        "Bird": "feathered", 
+        "Fish": "finned", 
+        "House": "windowed",
+        "Airplane": "winged",
+        "Flower": "petaled",
+        "Book": "paged", 
+        "Chair": "legged",
+        "Cat": "tailed"
+    },
+    "Shape": {
+        "Ball": "round",
+        "Plate": "round",
+        "Clock": "round",
+        "Wheel": "round",
+        "Coin": "round",
+        "Box": "square",
+        "Window": "square",
+        "Book": "square",
+        "Table": "square",
+        "Dice": "square"
+    },
+    "Material & Texture": {
+        "Table": "wooden",
+        "Spoon": "silver",
+        "Mug": "ceramic",
+        "Blanket": "woolen",
+        "Door": "wooden",
+        "Shoe": "leather",
+        "Bag": "fabric",
+        "Candle": "wax",
+        "Ring": "golden",
+        "Statue": "marble"
+    },
+    "Size": {
+        "Elephant": "big",
+        "Whale": "big",
+        "Truck": "big",
+        "Building": "big",
+        "Wind turbine": "big",
+        "Ant": "small",
+        "Mouse": "small",
+        "Pebble": "small",
+        "Key": "small",
+        "Bird": "small"
+    },
+    "Temperature": {
+        "Tea": "hot",
+        "Coffee": "hot",
+        "Soup": "hot",
+        "Ice cube": "cold",
+        "Water bottle": "cold",
+        "Juice": "cold",
+        "Fireplace": "hot",
+        "Stove": "hot", 
+        "Engine": "hot",
+        "Ice cream": "cold"
+    }
+}
+
+# Define similar attributes that shouldn't be paired
 SIMILAR_ATTRIBUTES = {
     "Part-Whole": [
-        {"leafy","petaled"},
-        {"feathered", "finned"},
+        {"leafy", "petaled"},  # Both are plant features
+        {"feathered", "finned"},  # Both are animal coverings
+        {"feathered", "winged"},  # Birds have both features
+        {"tailed", "finned"},  # Fish have both features
+        {"tailed", "legged"},  # Cats and Birds have both features
+        {"feathered", "legged"},  # Birds have both features
     ],
     "Shape": [
-        {"circular"},
-        {"rectangular"}
+        {"round"},
+        {"square"}
+    ],
+    "Material & Texture": [
+        {"fabric", "leather"},  # Bags can be either fabric or leather
     ],
     "Size": [
         {"big"},

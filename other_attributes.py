@@ -18,6 +18,7 @@ import random
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
+from diffusers.models.attention_processor import AttnProcessor
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -27,6 +28,43 @@ torch.cuda.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 np.random.seed(seed) 
 random.seed(seed)
+
+class SaveAttnProcessor(AttnProcessor):
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None):
+        # Compute queries/keys/values
+        batch_size, seq_len, _ = hidden_states.shape
+        query = attn.to_q(hidden_states)
+
+        context = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        key = attn.to_k(context)
+        value = attn.to_v(context)
+
+        # Reshape to (batch, heads, seq, dim)
+        query = attn.head_to_batch_dim(query)
+        key   = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        # Attention scores -> probs
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) * attn.scale
+        attn_probs  = torch.nn.functional.softmax(attn_scores, dim=-1)
+
+        # Save the attention map
+        if encoder_hidden_states is not None:
+            self.store.append(attn_probs.detach().cpu())
+
+        # Apply attention to values
+        hidden_states = torch.matmul(attn_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # Final projection
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
 
 INTERPOLATIONS = {
     'bilinear': InterpolationMode.BILINEAR,
@@ -99,14 +137,86 @@ ATTRIBUTES = {
 }
 
 # Define similar attributes that shouldn't be paired
+# Define attributes for each object in each category
+ATTRIBUTES = {
+    "Part-Whole": {
+        "Tree": "leafy",
+        "Car": "wheeled",
+        "Bird": "feathered", 
+        "Fish": "finned", 
+        "House": "windowed",
+        "Airplane": "winged",
+        "Flower": "petaled",
+        "Book": "paged", 
+        "Chair": "legged",
+        "Cat": "tailed"
+    },
+    "Shape": {
+        "Ball": "round",
+        "Plate": "round",
+        "Clock": "round",
+        "Wheel": "round",
+        "Coin": "round",
+        "Box": "square",
+        "Window": "square",
+        "Book": "square",
+        "Table": "square",
+        "Dice": "square"
+    },
+    "Material & Texture": {
+        "Table": "wooden",
+        "Spoon": "silver",
+        "Mug": "ceramic",
+        "Blanket": "woolen",
+        "Door": "wooden",
+        "Shoe": "leather",
+        "Bag": "fabric",
+        "Candle": "wax",
+        "Ring": "golden",
+        "Statue": "marble"
+    },
+    "Size": {
+        "Elephant": "big",
+        "Whale": "big",
+        "Truck": "big",
+        "Building": "big",
+        "Wind turbine": "big",
+        "Ant": "small",
+        "Mouse": "small",
+        "Pebble": "small",
+        "Key": "small",
+        "Bird": "small"
+    },
+    "Temperature": {
+        "Tea": "hot",
+        "Coffee": "hot",
+        "Soup": "hot",
+        "Ice cube": "cold",
+        "Water bottle": "cold",
+        "Juice": "cold",
+        "Fireplace": "hot",
+        "Stove": "hot", 
+        "Engine": "hot",
+        "Ice cream": "cold"
+    }
+}
+
+# Define similar attributes that shouldn't be paired
 SIMILAR_ATTRIBUTES = {
     "Part-Whole": [
-        {"leafy","petaled"},
-        {"feathered", "finned"},
+        {"leafy", "petaled"},  # Both are plant features
+        {"feathered", "finned"},  # Both are animal coverings
+        {"feathered", "winged"},  # Birds have both features
+        {"tailed", "finned"},  # Fish have both features
+        {"tailed", "legged"},  # Cats and Birds have both features
+        {"feathered", "legged"},  # Birds have both features
     ],
     "Shape": [
-        {"circular"},
-        {"rectangular"}
+        {"round"},
+        {"square"}
+    ],
+    "Material & Texture": [
+        {"fabric", "leather"},  # Bags can be either fabric or leather
     ],
     "Size": [
         {"big"},
@@ -467,6 +577,300 @@ class DiffusionEvaluator:
                 idx += len(batch_ts)
         return pred_errors
 
+        
+    def eval_error_visualize(self, unet, scheduler, vae, tokenizer, original_image, latent, all_noise, ts, noise_idxs,
+                    text_embeds, text_embed_idxs, target_object, batch_size=32, dtype='float32', loss='l2', T=1000,
+                    visualize=False, prompts=None):
+        """
+        Evaluate denoising error in pixel space with comprehensive visualization.
+        
+        Args:
+            prompts: List of prompt strings corresponding to text_embeds (needed for visualization titles)
+        """
+        assert len(ts) == len(noise_idxs) == len(text_embed_idxs)
+        pred_errors = torch.zeros(len(ts), device='cpu')
+        idx = 0
+        
+        # Store data for visualization - organized by prompt
+        if visualize:
+            viz_data = defaultdict(lambda: {
+                'images': [], 
+                'errors': [], 
+                'timesteps': [],
+                'attention_maps': []
+            })
+        
+        with torch.inference_mode():
+            for batch_idx in tqdm.trange(len(ts) // batch_size + int(len(ts) % batch_size != 0), leave=False):
+                batch_ts = torch.tensor(ts[idx: idx + batch_size])
+                batch_text_idxs = text_embed_idxs[idx: idx + batch_size]
+                noise = all_noise[noise_idxs[idx: idx + batch_size]]
+                
+                # Create noised latent
+                alpha_prod_t = scheduler.alphas_cumprod[batch_ts]
+                sqrt_alpha_prod = (alpha_prod_t ** 0.5).view(-1, 1, 1, 1).to(self.device)
+                sqrt_one_minus_alpha_prod = ((1 - alpha_prod_t) ** 0.5).view(-1, 1, 1, 1).to(self.device)
+                
+                noised_latent = latent * sqrt_alpha_prod + noise * sqrt_one_minus_alpha_prod
+                
+                # Prepare inputs
+                t_input = batch_ts.to(self.device).half() if dtype == 'float16' else batch_ts.to(self.device)
+                text_input = text_embeds[batch_text_idxs]
+                if dtype == 'float16':
+                    text_input = text_input.half()
+                    noised_latent = noised_latent.half()
+
+                attention_store = []
+                unet.set_attn_processor(SaveAttnProcessor(attention_store))
+
+                noise_pred = unet(noised_latent, t_input, encoder_hidden_states=text_input).sample
+                
+                # Denoise to get predicted clean latent
+                denoised_latent = (noised_latent - sqrt_one_minus_alpha_prod * noise_pred) / sqrt_alpha_prod
+                
+                reconstructed_image = vae.decode(denoised_latent / vae.config.scaling_factor).sample
+            
+                # Convert to float32 for error computation if needed
+                if dtype == 'float16':
+                    reconstructed_image = reconstructed_image.float()
+                
+                # Compute error in pixel space
+                if loss == 'l2':
+                    error = F.mse_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                elif loss == 'l1':
+                    error = F.l1_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                elif loss == 'huber':
+                    error = F.huber_loss(original_image, reconstructed_image, reduction='none').mean(dim=1)
+                else:
+                    raise NotImplementedError
+                
+                # Average over spatial dimensions for the metric
+                pred_errors[idx: idx + len(batch_ts)] = error.mean(dim=(1, 2)).detach().cpu()                        
+                
+                if visualize:
+                    for i in range(len(batch_ts)):
+                        prompt_idx = batch_text_idxs[i]
+                        viz_data[prompt_idx]['images'].append(reconstructed_image[i].detach().cpu())
+                        viz_data[prompt_idx]['errors'].append(error[i].detach().cpu())
+                        viz_data[prompt_idx]['timesteps'].append(batch_ts[i].item())
+                        viz_data[prompt_idx]['attention_maps'].append([attn[i:i+1].detach().cpu() for attn in attention_store])
+                
+                idx += len(batch_ts)
+        
+        # Create visualizations for all prompts
+        if visualize and len(viz_data) > 0:
+            timestamp = datetime.now().strftime("%H%M%S")
+            
+            for prompt_idx, data in viz_data.items():
+                prompt_text = prompts[prompt_idx] if prompts is not None else f"Prompt {prompt_idx}"
+                
+                # Convert lists to tensors
+                recon_images = torch.stack(data['images'])
+                error_maps = torch.stack(data['errors'])
+                timesteps = torch.tensor(data['timesteps'])
+                
+                # Save error heatmap
+                save_path = osp.join(self.run_folder, f'error_heatmap_prompt{prompt_idx}_{timestamp}.png')
+                self.visualize_error_heatmap(
+                    original_image, target_object, recon_images, error_maps, 
+                    timesteps, prompt_text, save_path=save_path
+                )
+                
+                # Save attention visualization across all timesteps
+                p = prompt_text[:-1].lower() if prompt_text.endswith('.') else prompt_text.lower()
+                tokens_to_vis = p.split()[1:3]  # visualize attribute and object tokens
+                
+                attn_save_path = osp.join(self.run_folder, f'attention_prompt{prompt_idx}_{timestamp}.png')
+                self.visualize_token_attention_grid(
+                    attention_maps=data['attention_maps'],
+                    image=original_image,
+                    prompt=prompt_text,
+                    tokenizer=tokenizer,
+                    tokens_to_vis=tokens_to_vis,
+                    timesteps=timesteps,
+                    save_path=attn_save_path
+                )
+        
+        return pred_errors
+
+
+    def visualize_error_heatmap(self, original_image, target_object, reconstructed_images, 
+                            error_maps, timesteps, prompt_text, save_path=None):
+        """
+        Visualize original image, reconstructed images, and error heatmaps for all timesteps.
+        """
+        num_samples = len(reconstructed_images)
+        
+        # Sort by timestep
+        sort_idx = torch.argsort(timesteps)
+        timesteps = timesteps[sort_idx]
+        reconstructed_images = reconstructed_images[sort_idx]
+        error_maps = error_maps[sort_idx]
+        
+        # Determine grid layout
+        max_cols = 6
+        num_rows = (num_samples + max_cols - 1) // max_cols
+        num_cols = min(num_samples, max_cols)
+        
+        fig = plt.figure(figsize=(5 * num_cols, 10 * num_rows))
+        gs = fig.add_gridspec(num_rows + 1, num_cols, hspace=0.3, wspace=0.3)
+        
+        # Convert original image to numpy and normalize to [0, 1]
+        orig_img = ((original_image[0].cpu().numpy().transpose(1, 2, 0) + 1) / 2).clip(0, 1).astype(np.float32)
+        
+        # Plot original image spanning first row
+        ax_orig = fig.add_subplot(gs[0, :])
+        ax_orig.imshow(orig_img)
+        ax_orig.set_title(f'Original Image: {target_object}\nPrompt: "{prompt_text}"', 
+                        fontsize=12, fontweight='bold')
+        ax_orig.axis('off')
+        
+        # Plot reconstructed images and error maps
+        for i in range(num_samples):
+            row = (i // num_cols) + 1
+            col = i % num_cols
+            
+            ax = fig.add_subplot(gs[row, col])
+            
+            recon_img = ((reconstructed_images[i].cpu().numpy().transpose(1, 2, 0) + 1) / 2).clip(0, 1).astype(np.float32)
+            error_map = error_maps[i].cpu().numpy().astype(np.float32)
+            
+            # Show reconstructed image
+            ax.imshow(recon_img, extent=[0, 1, 0.5, 1])
+            
+            # Show error heatmap
+            im = ax.imshow(error_map, cmap='hot', interpolation='nearest', 
+                        extent=[0, 1, 0, 0.5], aspect='auto')
+            
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_title(f't={timesteps[i].item()}\nAvg Error: {error_map.mean():.4f}', 
+                        fontsize=10)
+            ax.axis('off')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.ax.tick_params(labelsize=8)
+        
+        plt.suptitle(f'Reconstruction Error Analysis - {target_object}', 
+                    fontsize=14, fontweight='bold', y=0.995)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Visualization saved to {save_path}")
+            plt.close()
+        
+        return fig
+
+
+    def visualize_token_attention_grid(self, attention_maps, image, prompt, tokenizer, 
+                                    tokens_to_vis, timesteps, upsample_size=(512, 512), 
+                                    save_path=None):
+        """
+        Visualize attention maps across all timesteps in a grid layout.
+        """
+        # Tokenize prompt
+        tokens = tokenizer.tokenize(prompt)
+        tokens = [t.replace("</w>", "") for t in tokens]
+        
+        # Find token indices for visualization
+        token_indices = []
+        for word in tokens_to_vis:
+            matches = [i for i, tok in enumerate(tokens) if word in tok]
+            if not matches:
+                print(f"Token '{word}' not found in: {tokens}")
+            else:
+                token_indices.append((word, matches))
+        
+        if not token_indices:
+            print("No tokens found to visualize")
+            return
+        
+        # Sort by timestep
+        sort_idx = torch.argsort(timesteps)
+        timesteps = timesteps[sort_idx]
+        attention_maps = [attention_maps[i] for i in sort_idx]
+        
+        # Prepare image
+        image_to_plot = image[0] if image.ndim == 4 else image
+        image_np = image_to_plot.permute(1, 2, 0).cpu().numpy()
+        
+        if image_np.dtype not in ['float32', 'float64']:
+            image_np = image_np.astype('float32')
+        if image_np.min() < 0:
+            image_np = (image_np - image_np.min()) / (image_np.max() - image_np.min() + 1e-8)
+        
+        # Determine grid layout
+        num_timesteps = len(attention_maps)
+        max_cols = 6
+        num_rows = (num_timesteps + max_cols - 1) // max_cols
+        num_cols = min(num_timesteps, max_cols)
+        
+        # Create figure for each token
+        for token_word, token_word_ids in token_indices:
+            fig = plt.figure(figsize=(5 * num_cols, 10 * num_rows))
+            gs = fig.add_gridspec(num_rows + 1, num_cols, hspace=0.3, wspace=0.3)
+            
+            # Plot original image spanning first row
+            ax_orig = fig.add_subplot(gs[0, :])
+            ax_orig.imshow(image_np)
+            ax_orig.set_title(f'Original Image\nPrompt: "{prompt}"\nToken: "{token_word}"', 
+                            fontsize=12, fontweight='bold')
+            ax_orig.axis('off')
+            
+            # Process and plot attention maps for each timestep
+            for idx, (attn_store, t) in enumerate(zip(attention_maps, timesteps)):
+                row = (idx // num_cols) + 1
+                col = idx % num_cols
+                
+                # Process attention maps
+                resized = []
+                for attn in attn_store:
+                    if attn.dim() == 4:
+                        attn = attn.squeeze(0)
+                    
+                    heads, HW, tokens = attn.shape
+                    h = w = int(HW ** 0.5)
+                    attn_map = attn.view(heads, h, w, tokens).permute(0, 3, 1, 2)
+                    attn_map = F.interpolate(attn_map, size=(64, 64), mode="bilinear", align_corners=False)
+                    resized.append(attn_map)
+                
+                attn_all = torch.cat(resized, dim=0)
+                attn_mean = attn_all.mean(0)
+                
+                # Average over token pieces
+                heatmap = attn_mean[token_word_ids].mean(0)
+                
+                # Normalize
+                heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+                
+                # Upsample
+                heatmap_up = heatmap.unsqueeze(0).unsqueeze(0)
+                heatmap_up = F.interpolate(heatmap_up, size=upsample_size, mode="bilinear", align_corners=False)
+                heatmap_up = heatmap_up.squeeze().cpu().numpy()
+                
+                # Plot overlay
+                ax = fig.add_subplot(gs[row, col])
+                ax.imshow(image_np)
+                im = ax.imshow(heatmap_up, cmap='jet', alpha=0.6, interpolation='nearest')
+                ax.axis('off')
+                ax.set_title(f't={t.item()}\nAttn: {heatmap.mean():.4f}', fontsize=10)
+                
+                cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cbar.ax.tick_params(labelsize=8)
+            
+            plt.suptitle(f'Cross-Attention Maps for "{token_word}"', 
+                        fontsize=14, fontweight='bold', y=0.995)
+            
+            if save_path:
+                base_path = save_path.replace('.png', '')
+                token_save_path = f"{base_path}_{token_word}.png"
+                plt.savefig(token_save_path, dpi=150, bbox_inches='tight')
+                print(f"Attention visualization for '{token_word}' saved to {token_save_path}")
+                plt.close()
+        
+        return fig
+
     def eval_prob_adaptive(self, unet, latent, text_embeds, scheduler, args, image, target_object, 
                         latent_size=64, all_noise=None, prompts=None, prompt_attributes=None):
         scheduler_config = get_scheduler_config(args)
@@ -500,8 +904,16 @@ class DiffusionEvaluator:
                     text_embed_idxs.extend([prompt_i] * args.n_trials)
             t_evaluated.update(curr_t_to_eval)
             
-            pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
-                                text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, T)
+            # Use visualization if requested
+            if args.visualize:
+                pred_errors = self.eval_error_visualize(
+                    unet, scheduler, self.vae, self.tokenizer, image, latent, all_noise, ts, noise_idxs,
+                    text_embeds, text_embed_idxs, target_object, args.batch_size, args.dtype, 
+                    args.loss, T, visualize=True, prompts=prompts
+                )
+            else:
+                pred_errors = self.eval_error(unet, scheduler, latent, all_noise, ts, noise_idxs,
+                                    text_embeds, text_embed_idxs, args.batch_size, args.dtype, args.loss, T)
             
             for prompt_i in remaining_prmpt_idxs:
                 mask = torch.tensor(text_embed_idxs) == prompt_i
@@ -525,6 +937,7 @@ class DiffusionEvaluator:
             all_losses[prompt_i] = data[prompt_i]['pred_errors'].mean()
 
         return all_losses, pred_idx, data
+    
 
     def perform_attribute_classification_compound(self, image, obj1, obj2, target_object, target_attr, other_object_attr):
         """Perform attribute classification for a specific object in compound image"""
@@ -960,6 +1373,9 @@ def main():
 
     parser.add_argument('--to_keep', nargs='+', default=[1], type=int)
     parser.add_argument('--n_samples', nargs='+', default=[50], type=int)
+
+    parser.add_argument('--visualize', action='store_true', default=False, 
+                    help='Visualize error heatmaps and attention maps during evaluation')
 
     args = parser.parse_args()
     assert len(args.to_keep) == len(args.n_samples)
