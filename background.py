@@ -41,25 +41,14 @@ INTERPOLATIONS = {
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
 
-def pad_to_square(image):
-    """Pad image to square shape"""
-    width, height = image.size
-    max_dim = max(width, height)
-    
-    # Calculate padding for each side
-    pad_left = (max_dim - width) // 2
-    pad_right = max_dim - width - pad_left
-    pad_top = (max_dim - height) // 2
-    pad_bottom = max_dim - height - pad_top
-    
-    # Apply padding (left, top, right, bottom)
-    padding = (pad_left, pad_top, pad_right, pad_bottom)
-    return torch_transforms.functional.pad(image, padding, fill=255, padding_mode='constant')
+def _convert_image_to_rgb(image):
+    return image.convert("RGB")
+
 
 def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     transform = torch_transforms.Compose([
-        torch_transforms.Lambda(pad_to_square),
         torch_transforms.Resize(size, interpolation=interpolation),
+        torch_transforms.CenterCrop(size),
         _convert_image_to_rgb,
         torch_transforms.ToTensor(),
         torch_transforms.Normalize([0.5], [0.5])
