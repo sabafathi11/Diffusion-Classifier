@@ -9,7 +9,7 @@ MODEL_IDS = {
     '1-4': "CompVis/stable-diffusion-v1-4",
     '1-5': "runwayml/stable-diffusion-v1-5",
     '2-0': "stabilityai/stable-diffusion-2-base",
-    '2-1': "stabilityai/stable-diffusion-2-1-base"
+    '2-1': "stabilityai/stable-diffusion-2-1-base",
 }
 
 def get_sd_model(args):
@@ -24,13 +24,23 @@ def get_sd_model(args):
     model_id = MODEL_IDS[args.version]
 
     # use your datasets folder as cache dir
-    custom_cache = "/mnt/public/Ehsan/docker_private/learning2/saba/datasets/SD"
+    custom_cache = "/saba/datasets/SD"
+
+    local_model_path = "/saba/datasets/SD/models--stabilityai--stable-diffusion-2-base/snapshots/fa386bb446685d8ad8a8f06e732a66ad10be6f47"
+
+    # Use local path for version 2-0 and 2-1, otherwise use model_id with custom cache
+    if args.version in {'2-0', '2-1'}:
+        model_source = local_model_path
+        cache_dir = None
+    else:
+        model_source = model_id
+        cache_dir = custom_cache
 
     scheduler = EulerDiscreteScheduler.from_pretrained(
-        model_id, subfolder="scheduler", cache_dir=custom_cache
+        model_source, subfolder="scheduler", cache_dir=cache_dir
     )
     pipe = StableDiffusionPipeline.from_pretrained(
-        model_id, scheduler=scheduler, torch_dtype=dtype, cache_dir=custom_cache
+        model_source, scheduler=scheduler, torch_dtype=dtype, cache_dir=cache_dir
     )
     #pipe.enable_xformers_memory_efficient_attention()
 

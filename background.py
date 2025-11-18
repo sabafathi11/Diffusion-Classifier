@@ -41,9 +41,6 @@ INTERPOLATIONS = {
 def _convert_image_to_rgb(image):
     return image.convert("RGB")
 
-def _convert_image_to_rgb(image):
-    return image.convert("RGB")
-
 
 def get_transform(interpolation=InterpolationMode.BICUBIC, size=512):
     transform = torch_transforms.Compose([
@@ -209,9 +206,16 @@ class DiffusionEvaluator:
         
         print(f"Total unique classes: {len(self.all_classes)}")
         
-        # Initialize confusion matrix
+        # Initialize overall confusion matrix
         self.confusion_matrix = np.zeros((len(self.class_codes), len(self.class_codes)), dtype=int)
         self.code_to_idx = {code: idx for idx, code in enumerate(self.class_codes)}
+        
+        # Initialize per-intervention confusion matrices
+        self.intervention_confusion_matrices = {}
+        for intervention in self.args.interventions:
+            self.intervention_confusion_matrices[intervention] = np.zeros(
+                (len(self.class_codes), len(self.class_codes)), dtype=int
+            )
         
     def _setup_models(self):
         self.vae, self.tokenizer, self.text_encoder, self.unet, self.scheduler = get_sd_model(self.args)
@@ -717,43 +721,54 @@ class DiffusionEvaluator:
         
         return predicted_class_code, predicted_class_name, is_correct, prompts, pred_idx, all_losses
 
-    def save_confusion_matrix(self):
-        """Save confusion matrix visualization and CSV"""
+    def save_confusion_matrix(self, confusion_matrix, class_codes, class_names, prefix=""):
+        """Save confusion matrix visualization and CSV
+        
+        Args:
+            confusion_matrix: The confusion matrix to save
+            class_codes: List of class codes
+            class_names: List of class names
+            prefix: Prefix for filename (e.g., intervention name or empty for overall)
+        """
+        filename_prefix = f"{prefix}_" if prefix else ""
+        
         # Save as CSV
-        df = pd.DataFrame(self.confusion_matrix, 
-                         index=self.class_codes, 
-                         columns=self.class_codes)
-        csv_path = osp.join(self.run_folder, 'confusion_matrix.csv')
+        df = pd.DataFrame(confusion_matrix, 
+                         index=class_codes, 
+                         columns=class_codes)
+        csv_path = osp.join(self.run_folder, f'{filename_prefix}confusion_matrix.csv')
         df.to_csv(csv_path)
         print(f"Confusion matrix saved to {csv_path}")
         
         # Create visualization (if not too large)
-        if len(self.class_codes) <= 50:
+        if len(class_codes) <= 50:
             plt.figure(figsize=(20, 18))
-            sns.heatmap(self.confusion_matrix, annot=False, fmt='d', cmap='Blues',
-                       xticklabels=self.class_codes, yticklabels=self.class_codes,
+            sns.heatmap(confusion_matrix, annot=False, fmt='d', cmap='Blues',
+                       xticklabels=class_codes, yticklabels=class_codes,
                        cbar_kws={'label': 'Count'})
             plt.xlabel('Predicted Class')
             plt.ylabel('True Class')
-            plt.title('ImageNet-B Classification Confusion Matrix')
+            title = f'{prefix} Confusion Matrix' if prefix else 'Overall Confusion Matrix'
+            plt.title(f'ImageNet-B Classification {title}')
             plt.tight_layout()
             
-            fig_path = osp.join(self.run_folder, 'confusion_matrix.png')
+            fig_path = osp.join(self.run_folder, f'{filename_prefix}confusion_matrix.png')
             plt.savefig(fig_path, dpi=150, bbox_inches='tight')
             plt.close()
             print(f"Confusion matrix visualization saved to {fig_path}")
         
         # Calculate and save per-class metrics
-        metrics_path = osp.join(self.run_folder, 'per_class_metrics.txt')
+        metrics_path = osp.join(self.run_folder, f'{filename_prefix}per_class_metrics.txt')
         with open(metrics_path, 'w') as f:
-            f.write("Per-Class Metrics\n")
+            title_text = f"Per-Class Metrics - {prefix}" if prefix else "Per-Class Metrics - Overall"
+            f.write(f"{title_text}\n")
             f.write("=" * 80 + "\n\n")
             
-            for i, (code, name) in enumerate(zip(self.class_codes, self.class_names)):
-                true_positives = self.confusion_matrix[i, i]
-                false_positives = self.confusion_matrix[:, i].sum() - true_positives
-                false_negatives = self.confusion_matrix[i, :].sum() - true_positives
-                total_true = self.confusion_matrix[i, :].sum()
+            for i, (code, name) in enumerate(zip(class_codes, class_names)):
+                true_positives = confusion_matrix[i, i]
+                false_positives = confusion_matrix[:, i].sum() - true_positives
+                false_negatives = confusion_matrix[i, :].sum() - true_positives
+                total_true = confusion_matrix[i, :].sum()
                 
                 if total_true > 0:
                     recall = true_positives / total_true * 100
@@ -778,6 +793,26 @@ class DiffusionEvaluator:
                 f.write(f"  F1-Score: {f1:.2f}\n\n")
         
         print(f"Per-class metrics saved to {metrics_path}")
+
+    def save_all_confusion_matrices(self):
+        """Save overall and per-intervention confusion matrices"""
+        # Save overall confusion matrix
+        print("\n" + "="*80)
+        print("Saving Overall Confusion Matrix")
+        print("="*80)
+        self.save_confusion_matrix(self.confusion_matrix, self.class_codes, self.class_names, prefix="")
+        
+        # Save per-intervention confusion matrices
+        for intervention in self.args.interventions:
+            print("\n" + "="*80)
+            print(f"Saving Confusion Matrix for Intervention: {intervention}")
+            print("="*80)
+            self.save_confusion_matrix(
+                self.intervention_confusion_matrices[intervention],
+                self.class_codes,
+                self.class_names,
+                prefix=intervention
+            )
 
     def save_results_summary(self):
         """Save a summary of classification results."""
@@ -847,11 +882,15 @@ class DiffusionEvaluator:
                     predicted_code = data['predicted_class_code']
                     true_code = data['true_class_code']
                     
-                    # Update confusion matrix
+                    # Update overall confusion matrix
                     if true_code in self.code_to_idx and predicted_code in self.code_to_idx:
                         true_idx = self.code_to_idx[true_code]
                         pred_idx = self.code_to_idx[predicted_code]
                         self.confusion_matrix[true_idx, pred_idx] += 1
+                        
+                        # Update per-intervention confusion matrix
+                        if intervention_type in self.intervention_confusion_matrices:
+                            self.intervention_confusion_matrices[intervention_type][true_idx, pred_idx] += 1
                     
                     if is_correct:
                         self.correct_predictions += 1
@@ -866,10 +905,14 @@ class DiffusionEvaluator:
                 image, class_code
             )
             
-            # Update confusion matrix
+            # Update overall confusion matrix
             true_idx = self.code_to_idx[class_code]
             pred_idx_cm = self.code_to_idx[predicted_code]
             self.confusion_matrix[true_idx, pred_idx_cm] += 1
+            
+            # Update per-intervention confusion matrix
+            if intervention in self.intervention_confusion_matrices:
+                self.intervention_confusion_matrices[intervention][true_idx, pred_idx_cm] += 1
             
             if is_correct:
                 self.correct_predictions += 1
@@ -896,9 +939,9 @@ class DiffusionEvaluator:
                 classification_idx=i
             ), fname)
         
-        # Generate summary
+        # Generate summary and save all confusion matrices
         self.save_results_summary()
-        self.save_confusion_matrix()
+        self.save_all_confusion_matrices()
         
         # Print final results
         if self.total_classifications > 0:
@@ -919,17 +962,17 @@ def main():
 
     # ImageNet-B dataset args
     parser.add_argument('--imagenet_b_dir', type=str,
-                        default='/data/saba/datasets/imagenet-b',
+                        default='/saba/datasets/imagenet-b',
                         help='Path to ImageNet-B root directory')
     parser.add_argument('--interventions', nargs='+', 
-                        default=['color'],
+                        default=['BLiP-Caption', 'Class-Name', 'color', 'origin', 'Texture'],
                         choices=['BLiP-Caption', 'Class-Name', 'color', 'origin', 'Texture'],
                         help='Which intervention types to evaluate')
     
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
-    parser.add_argument('--batch_size', '-b', type=int, default=1, help='Batch size')
+    parser.add_argument('--batch_size', '-b', type=int, default=32, help='Batch size')
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),

@@ -1320,7 +1320,7 @@ def main():
 
     # dataset args
     parser.add_argument('--cab_folder', type=str,
-                        default='/mnt/public/Ehsan/docker_private/learning2/saba/datasets/color',
+                        default='/data/saba/datasets/color',
                         help='Path to color folder')
     parser.add_argument('--mode', type=str, default='compound_unnatural', 
                         choices=['compound', 'single', 'compound_unnatural', 'single_unnatural'],

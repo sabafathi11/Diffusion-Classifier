@@ -6,7 +6,7 @@ import os.path as osp
 import torch
 from PIL import Image
 
-DATASET_ROOT = os.getenv('DATASET_ROOT', '/mnt/public/Ehsan/docker_private/learning2/saba/datasets')
+DATASET_ROOT = os.getenv('DATASET_ROOT', '/saba/datasets')
 LOG_DIR = os.getenv('LOG_DIR', '/saba/Diffusion-Classifier/data')
 TOKEN_PATH = os.getenv('TOKEN_PATH', osp.expanduser('~/hf_token.txt'))
 HDD_ROOT = os.getenv('HDD_ROOT', '')  # should point to the HDD path on each machine

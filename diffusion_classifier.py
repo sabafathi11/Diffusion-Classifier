@@ -469,7 +469,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # dataset args
-    parser.add_argument('--dataset', type=str, default='pets',
+    parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['pets', 'flowers', 'stl10', 'mnist', 'cifar10', 'food', 'caltech101', 'imagenet',
                                  'objectnet', 'aircraft'], help='Dataset to use')
     parser.add_argument('--split', type=str, default='train', choices=['train', 'test'], help='Name of split')
@@ -479,7 +479,7 @@ def main():
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
     parser.add_argument('--batch_size', '-b', type=int, default=32)
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
-    parser.add_argument('--prompt_path', type=str, default='prompts/pets_prompts.csv', help='Path to csv file with prompts to use')
+    parser.add_argument('--prompt_path', type=str, default='prompts/cifar10_prompts.csv', help='Path to csv file with prompts to use')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--subset_path', type=str, default=None, help='Path to subset of images to evaluate')
     parser.add_argument('--samples_per_class', type=int, default=10, help='Number of samples per class for balanced subset')
