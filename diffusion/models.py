@@ -24,9 +24,9 @@ def get_sd_model(args):
     model_id = MODEL_IDS[args.version]
 
     # use your datasets folder as cache dir
-    custom_cache = "/saba/datasets/SD"
+    custom_cache = "saba/datasets/SD"
 
-    local_model_path = "/saba/datasets/SD/models--stabilityai--stable-diffusion-2-base/snapshots/fa386bb446685d8ad8a8f06e732a66ad10be6f47"
+    local_model_path = "saba/datasets/SD/models--stabilityai--stable-diffusion-2-base/snapshots/fa386bb446685d8ad8a8f06e732a66ad10be6f47"
 
     # Use local path for version 2-0 and 2-1, otherwise use model_id with custom cache
     if args.version in {'2-0', '2-1'}:

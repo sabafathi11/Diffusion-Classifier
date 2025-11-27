@@ -962,17 +962,17 @@ def main():
 
     # ImageNet-B dataset args
     parser.add_argument('--imagenet_b_dir', type=str,
-                        default='/saba/datasets/imagenet-b',
+                        default='saba/datasets/imagenet-b-selected',
                         help='Path to ImageNet-B root directory')
     parser.add_argument('--interventions', nargs='+', 
-                        default=['BLiP-Caption', 'Class-Name', 'color', 'origin', 'Texture'],
+                        default=['BLiP-Caption'],
                         choices=['BLiP-Caption', 'Class-Name', 'color', 'origin', 'Texture'],
                         help='Which intervention types to evaluate')
     
     # run args
     parser.add_argument('--version', type=str, default='2-0', help='Stable Diffusion model version')
     parser.add_argument('--img_size', type=int, default=512, choices=(256, 512), help='Image size')
-    parser.add_argument('--batch_size', '-b', type=int, default=32, help='Batch size')
+    parser.add_argument('--batch_size', '-b', type=int, default=1, help='Batch size')
     parser.add_argument('--n_trials', type=int, default=1, help='Number of trials per timestep')
     parser.add_argument('--noise_path', type=str, default=None, help='Path to shared noise to use')
     parser.add_argument('--dtype', type=str, default='float16', choices=('float16', 'float32'),
@@ -984,10 +984,10 @@ def main():
 
     # args for adaptively choosing which classes to continue trying
     parser.add_argument('--to_keep', nargs='+', default=[1], type=int)
-    parser.add_argument('--n_samples', nargs='+', default=[50], type=int)
+    parser.add_argument('--n_samples', nargs='+', default=[10], type=int)
     
     # Visualization argument
-    parser.add_argument('--visualize', action='store_true', default=False, 
+    parser.add_argument('--visualize', action='store_true', default=True, 
                         help='Visualize error heatmaps and attention maps during evaluation')
 
     args = parser.parse_args()

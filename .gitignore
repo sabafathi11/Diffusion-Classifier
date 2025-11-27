@@ -15,6 +15,7 @@ data/
 *.pth
 *.pkl
 trained_templates/
+saba/
 
 # Logs
 *.log
@@ -34,3 +35,6 @@ Thumbs.db
 *.png
 *.jpg
 *.jpeg
+
+background.bash
+env-conda.yml
