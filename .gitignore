@@ -14,7 +14,11 @@ data/
 *.pt
 *.pth
 *.pkl
-trained_templates/
+saba/
+samples/
+images/
+temp/
+visualizations/
 
 # Logs
 *.log
