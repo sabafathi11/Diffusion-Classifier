@@ -6,7 +6,6 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import tqdm
-from diffusion.datasets import get_target_dataset
 from diffusion.models import get_sd_model, get_scheduler_config
 from diffusion.utils import LOG_DIR, get_formatstr
 import torchvision.transforms as torch_transforms
